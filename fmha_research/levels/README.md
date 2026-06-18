@@ -27,11 +27,11 @@ module by name** in `reproduce_levels.LEVELS` instead. The level → module/env 
 | 6 | diagonal-pair tiling | structural | `fmha_prefill_fp8_v7` | vs `_8wave`, or `FMHA_DIAG=0/1` |
 | 7 | column-V (delete transpose) | structural | `fmha_prefill_fp8_ck` | vs `_v7`, or `FMHA_VCOL=0/1` |
 | 8 | LDS row padding | throughput | `fmha_prefill_fp8_ck_hk5` | vs `_ck`, or `FMHA_KPAD/VPAD=0/8` |
-| 9 | kdlds (K-descale→LDS) | throughput | `fmha_prefill_fp8_combined` | vs `_ck_hk5` |
-| 10 | LOG2E-descale + exp-bias hoist | throughput | `fmha_prefill_fp8_ck_log2dom` | vs `_combined` |
+| 9 | kdlds (K-descale→LDS) | throughput | `fmha_prefill_fp8_combined` | vs `_ck_hk5` (REGRESSES large seq, 123→107 @ sq16384) |
+| 10 | LOG2E-descale + exp-bias hoist | throughput | `fmha_prefill_fp8_ck_log2dom` | vs `_combined` (small-seq base; < hk5 at large seq) |
 | 11 | XCD chiplet remap | dispatch | `fmha_prefill_fp8_ck_log2dom` | `FMHA_XCD=0/1` (C=4) |
 | 12 | softmax VALU fold | throughput | `fmha_prefill_fp8_ck_log2dom` | baked in (no flag) |
-| 13 | per-seqlen (KT,DIAG) dispatch | dispatch | `fmha_prefill_fp8_ck_log2dom` | per-seqlen `FMHA_KT`/`FMHA_DIAG` |
+| 13 | per-seqlen (KT,DIAG) **+ base** dispatch | dispatch | `fmha_prefill_fp8_dispatch` (`best_base()`) | per-seqlen `FMHA_KT`/`FMHA_DIAG` + base (log2dom ≤2048, hk5 ≥16384) |
 
 If a future lever is ever NOT reachable from an existing module + flag (e.g. an atom that
 can't be toggled back), drop a `level_NN_<name>.py` snapshot here and load it with

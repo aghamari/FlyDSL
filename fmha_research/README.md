@@ -25,8 +25,10 @@ GEMM1  S = K @ Qᵀ   ([kv, q])  ->  online softmax (max / exp2 / sum, P registe
 * A runbook-disciplined path: hypothesis → parity gate (`ck_check.py`, err<6e-2) →
   device-fair best-of-N perf (`bench_fmha_fair.py`) → keep/revert → record, every level
   reproducible from one driver (`reproduce_levels.py`).
-* The two load-bearing structural wins — **column-V (delete the transpose)** and
-  **diagonal-pair causal tiling** — plus a stack of VALU/scheduling throughput levers.
+* The dominant throughput win — **LDS row-padding (hk5, 2.03× at sq32768)** — riding on the
+  two load-bearing structural wins (**column-V**, delete the transpose; and **diagonal-pair
+  causal tiling**), plus a stack of VALU/scheduling levers and a **per-seqlen base dispatch**
+  that picks the faster of {log2dom, hk5} for each shape.
 
 ## Hardware / software
 
@@ -43,49 +45,67 @@ GEMM1  S = K @ Qᵀ   ([kv, q])  ->  online softmax (max / exp2 / sum, P registe
 
 ## Result
 
-Device-fair TF, this kernel (per-seqlen dispatch over `fmha_prefill_fp8_ck_log2dom`) vs the
-CK-Tile fp8 reference. **All TF cells are placeholders — run `reproduce_levels.py` to fill
-them.** The expectation column is the handoff's last-measured numbers (confirm, don't trust).
+Device-fair TF, this kernel (**per-seqlen-BASE dispatch**, `best_base()` in
+`kernels/fmha_prefill_fp8_dispatch.py`) vs the CK-Tile fp8 reference. Each seqlen runs the
+faster base at its own optimal `(KT, DIAG)`: **log2dom** for sq≤2048, **hk5** for sq≥16384.
+Measured 2026-06-18 (graph-replay, bs=1 nq8 nk1 causal); see `results.tsv` for the raw rows.
 
-| seqlen | this kernel (TF) | CK-Tile fp8 (TF) | gap | expectation (this / CK) |
-| ------ | ---------------- | ---------------- | --- | ----------------------- |
-| 1024   | TBD (run reproduce_levels.py) | TBD | TBD | ~26 / ~30 (1.12x) |
-| 2048   | TBD (run reproduce_levels.py) | TBD | TBD | ~55 / ~62 (1.13x) |
-| 16384  | TBD (run reproduce_levels.py) | TBD | TBD | ~116 / ~141 (1.22x) |
-| 32768  | TBD (run reproduce_levels.py) | TBD | TBD | ~131 / ~146 (1.11x) |
+| seqlen | this kernel (TF) | CK-Tile fp8 (TF) | gap | base @ (KT,DIAG) |
+| ------ | ---------------- | ---------------- | ----- | ----------------- |
+| 1024   | 26  | 30  | 1.15× | log2dom, KT=64 DIAG=0 |
+| 2048   | 55  | 62  | 1.13× | log2dom, KT=64 DIAG=1 |
+| 16384  | 129 | 141 | 1.09× | hk5, KT=32 DIAG=0 |
+| 32768  | 142 | 146 | 1.03× | hk5, KT=32 DIAG=1 |
 
-The residual ~1.1–1.22x is the **0.2.0-scheduler structural wall**: the backend won't fill
-the softmax `exp` shadow with independent MFMA, so the VALU between the two MFMA bursts is
-exposed. It is *not* memory- or transpose-bound (column-V already removed that).
+The large-seq gap is nearly closed — **1.03× at sq32768, 1.09× at sq16384** — and is the
+residual **0.2.0-scheduler structural wall**: the backend won't fill the softmax `exp` shadow
+with independent MFMA, so the VALU between the two MFMA bursts is exposed. It is *not* memory-
+or transpose-bound (column-V already removed that). The small-seq gap (1.13–1.15× at
+sq1024/2048) is instead **grid-fill / dispatch-bound** — the grid is < 80 CU at sq1024 — which
+is why the small-seq dispatch family is the next frontier (see below).
 
 ## Optimization log (summary)
 
 Every kept lever, in order. Reproduced by `reproduce_levels.py`. Levers fall into four
 families: **baseline**, **structural** (remove wasted work), **throughput** (do the work
-faster), **dispatch** (launch / schedule only what's needed). `before→after` TF is at the
-largest measured seqlen unless noted; **fill from the driver** (`results.tsv`).
+faster), **dispatch** (launch / schedule only what's needed). Device-fair graph-replay TF,
+measured 2026-06-18; `x_prev` / `x_ck` are taken at **sq32768** (the largest shape).
 
-| #  | lever | family | A → B kernel | before→after TF | x |
-|----|-------|--------|--------------|-----------------|---|
-| 0  | baseline naive fp8 | baseline | `fmha_prefill_fp8` | TBD (run reproduce_levels.py) | — |
-| 1  | multiwave BM=128 / 4-wave | throughput | `fmha_prefill_fp8` → `_8wave` (`NWAVES=4`) | TBD | TBD |
-| 2  | cooperative K/V → LDS (ping-pong) | structural | embedded in `_8wave` | TBD | TBD |
-| 3  | register-P ds_bpermute transpose | throughput | embedded in `_8wave` | TBD | TBD |
-| 4  | fast `exp2` softmax | throughput | embedded in `_8wave` | TBD | TBD |
-| 5  | causal masked/unmasked loop split | structural | embedded in `_8wave` | TBD | TBD |
-| 6  | diagonal-pair causal tiling | structural | `_8wave` → `_v7` (`DIAG`) | TBD | TBD |
-| 7  | column-V (delete transpose) | structural | `_v7` → `_ck` (`VCOL`) | TBD | TBD |
-| 8  | LDS row padding (bank conflicts) | throughput | `_ck` → `_ck_hk5` (`KPAD/VPAD=8`) | TBD | TBD |
-| 9  | kdlds: K-descale → LDS | throughput | `_ck_hk5` → `_combined` | TBD | TBD |
-| 10 | LOG2E-descale + exp-bias hoist | throughput | `_combined` → `_ck_log2dom` | TBD | TBD |
-| 11 | XCD/chiplet block-ID remap | dispatch | `FMHA_XCD=0→1` (C=4) on `_ck_log2dom` | TBD | TBD |
-| 12 | softmax VALU fold (`v_max3`+p_scale) | throughput | baked into `_ck_log2dom` | TBD | TBD |
-| 13 | **per-seqlen (KT,DIAG) dispatch** | dispatch | dispatch over `_ck_log2dom` | TBD | TBD |
+| #  | lever | family | sq1024 | sq2048 | sq16384 | sq32768 | x_prev | x_ck |
+|----|-------|--------|--------|--------|---------|---------|--------|------|
+| 0  | baseline naive fp8 | baseline | 11 | 17 | 28 | 29 | — | 0.20× |
+| 1  | multiwave BM=128 / 4-wave | throughput | 15 | 20 | 47 | 53 | 1.83× | 0.36× |
+| 2  | cooperative K/V → LDS (ping-pong) | structural | 15 | 20 | 47 | 53 | 1.00× | 0.36× |
+| 3  | register-P ds_bpermute transpose | throughput | 15 | 20 | 47 | 53 | 1.00× | — |
+| 4  | fast `exp2` softmax | throughput | 15 | 20 | 47 | 53 | 1.00× | — |
+| 5  | causal masked/unmasked loop split | structural | 15 | 20 | 47 | 53 | 1.00× | — |
+| 6  | diagonal-pair causal tiling | structural | 13 | 30 | 52 | 57 | 1.08× | 0.39× |
+| 7  | column-V (delete transpose) | structural | 14 | 33 | 63 | 70 | 1.23× | 0.48× |
+| 8  | **LDS row padding (bank conflicts) = hk5** | throughput | 19 | 48 | **123** | **142** | **2.03×** | 0.97× |
+| 9  | kdlds: K-descale → LDS | throughput | 19 | 48 | 107 | 121 | **0.85×** ↓ | 0.83× |
+| 10 | LOG2E-descale + exp-bias hoist = log2dom | throughput | 18 | 46 | 115 | 131 | 1.08× | 0.90× |
+| 11 | XCD/chiplet block-ID remap | dispatch | 18 | 46 | 116 | 131 | 1.00× | — |
+| 12 | softmax VALU fold (`v_max3`+p_scale) | throughput | 18 | 46 | 116 | 131 | 1.00× | — |
+| 13 | per-seqlen (KT,DIAG) dispatch / log2dom | dispatch | 26 | 55 | 106 | 131 | — | 0.90× |
+| —  | **CK-Tile fp8 (reference)** | reference | 30 | 62 | 141 | 146 | — | — |
 
-The two biggest wins are **structural**: column-V (lever 7, removes the V-transpose DS-wait,
-LDS-wait 54%→18%) and the diagonal-pair causal balancer (lever 6, +8–24% at sq≥2048).
-The **dispatch** family (11, 13) closes the per-shape gap — KT=64 helps small seq but
-regresses large, so it must be chosen per shape. **Top of the ledger (L13) is the current best.**
+> **Levels 8–13 above were measured at the driver default (KT=32, DIAG=1, except L13 which
+> dispatches `(KT,DIAG)` per shape over the log2dom base).** At each seqlen's *optimal*
+> `(KT,DIAG)`, plain **hk5** hits **25 / 52 / 129 / 142** and **log2dom** hits
+> **26 / 55 / 106 / 131**. The production **current best = per-seqlen-BASE dispatch**
+> (`best_base()`): pick the faster base per shape — log2dom for sq≤2048, hk5 for sq≥16384 —
+> giving **26 / 55 / 129 / 142** (the headline `Result` table above).
+
+Two findings reshape the old story:
+
+* **L8 (LDS row-padding = hk5) is the single dominant win — 2.03× at sq32768** — and it is the
+  large-seq peak. The two structural levers that enable it are column-V (L7, removes the
+  V-transpose DS-wait, LDS-wait 54%→18%) and the diagonal-pair causal balancer (L6, +8–24% at
+  sq≥2048).
+* **The kdlds → log2dom stack REGRESSES at large seq.** L9 (kdlds) drops sq16384 123→107
+  (0.85×) and sq32768 142→121; L10 (log2dom) only partly recovers (115/131), still below hk5's
+  123/142. log2dom *wins only at sq≤2048*. This **overturns the prior "log2dom is the peak"
+  claim** — hence `best_base()` runs hk5, not log2dom, at large seq.
 
 ## Each lever, in depth
 
@@ -148,17 +168,22 @@ with the 32-bank (128 B) period. **Swept optimum: KPAD=VPAD=8** (108.5 TF @ sq16
 conflicts return; VPAD=4 → 59; VPAD=32 → 75). Padding affects only LDS buffer strides; global
 strides keep HD/KT. A/B: `_ck` → `_ck_hk5`, or `FMHA_KPAD/VPAD=0` vs `8`.
 
-### 9 — kdlds: stage K-descale in LDS (`_combined`, throughput)
+### 9 — kdlds: stage K-descale in LDS (`_combined`, throughput; LARGE-SEQ REGRESSION)
 The per-token K descale is staged into LDS (ping-ponged with the K/V tiles) so it is off the
-score-scaling critical path during the MFMA. A/B: `_ck_hk5` → `_combined`.
+score-scaling critical path during the MFMA. **This is a measured regression at large seq:**
+sq16384 123→107 (0.85×) and sq32768 142→121, while sq≤2048 are flat (19/48). The extra LDS
+traffic outweighs the saved scalar work once the kv loop is long. A/B: `_ck_hk5` → `_combined`.
 
 ### 10 — LOG2E-into-descale + exp-bias hoist (`_ck_log2dom`, throughput)
 Fold `LOG2E` into the descale constant so the **entire score domain is in log2 units**,
 removing the per-element `*LOG2E` before `exp2`; and hoist the per-tile exp bias out of the
-inner loop. This is the **measured-peak underlying kernel**; `fmha_prefill_fp8_layout` and
-`fmha_prefill_fp8_reorder` are its readability rewrites (same lowering). Device-fair it
-reaches ~109/129 TF graph-timed (116/131 rocprof) @ sq16384/32768 vs hk5 103/122.
-A/B: `_combined` → `_ck_log2dom`.
+inner loop. `fmha_prefill_fp8_layout` and `fmha_prefill_fp8_reorder` are its readability
+rewrites (same lowering). It **partly recovers the L9 regression** (sq16384 107→115, sq32768
+121→131) **but is still below the hk5 peak** (123/142) at large seq, and only *wins* at
+sq≤2048 (where it beats hk5 26/55 vs 25/52 at each shape's optimal `(KT,DIAG)`). This
+**overturns the earlier "log2dom is the measured peak" claim** — log2dom is the small-seq base,
+hk5 is the large-seq base, and `best_base()` (L13) dispatches between them. A/B: `_combined` →
+`_ck_log2dom`.
 
 ### 11 — XCD / chiplet block-ID remap (`_ck_log2dom`, dispatch)
 MI308X has 4 XCDs; HW routes physical block `b` → XCD `b % 4`. Invert that round-robin so
@@ -172,27 +197,31 @@ Fold the running-max update into `v_max3` (3-input max in one VALU op) and fold 
 into the descale. **Baked into log2dom**; no clean standalone flag, so its effect is part of
 the L10/L11 delta.
 
-### 13 — Per-seqlen (KT, DIAG) dispatch (dispatch; current best)
-`KT` and `DIAG` are compile-time constexpr (read from env at import), and the sweep found the
-per-seqlen optimum is purely `(KT, DIAG)`:
+### 13 — Per-seqlen (KT, DIAG) dispatch + per-seqlen BASE dispatch (dispatch; current best)
+`KT`, `DIAG`, and the underlying base are compile-time constexpr (read from env at import).
+The sweep found the per-seqlen optimum is `(base, KT, DIAG)`, and the production
+`best_base()` in `kernels/fmha_prefill_fp8_dispatch.py` encodes it:
 
-| seqlen | KT | DIAG | note |
-|--------|----|------|------|
-| ≤1024  | 64 | 0    | KT=64 amortizes softmax VALU at small seq |
-| ≤2048  | 64 | 1    | diag pairing helps once there are enough tiles |
-| ≤16384 | 32 | 0    | KT=64 REGRESSES large seq (116→86), back to 32 |
-| else   | 32 | 1    | diag + KT32 = large-seq peak |
+| seqlen | base | KT | DIAG | this kernel | note |
+|--------|------|----|------|-------------|------|
+| ≤1024  | log2dom | 64 | 0 | 26 | log2dom wins small seq; KT=64 amortizes softmax VALU |
+| ≤2048  | log2dom | 64 | 1 | 55 | diag pairing helps once there are enough tiles |
+| ≤16384 | hk5 | 32 | 0 | 129 | hk5 beats log2dom at large seq; KT=64 REGRESSES (116→86), back to 32 |
+| else   | hk5 | 32 | 1 | 142 | diag + KT32 on hk5 = large-seq peak |
 
-**Gotcha / discrepancy:** the production `kernels/fmha_prefill_fp8_dispatch.py` currently
-dispatches over `fmha_prefill_fp8_ck_hk5`, **not** `_ck_log2dom` (the measured peak). The
-driver therefore takes `--base` to choose the underlying module and defaults to `_ck_log2dom`.
-Because env is read at import and the SmemAllocator finalizes once per process, each seqlen
-class must be built in a fresh process — the driver forks one per (level, seqlen).
+The earlier story dispatched only `(KT,DIAG)` over a single base; the **new finding is that
+the base itself must be chosen per shape** (log2dom for sq≤2048, hk5 for sq≥16384), because
+the kdlds/log2dom stack regresses large seq (see L9/L10). Pinning to one base costs ~10% at
+sq16384 (log2dom 106 vs hk5 129). The driver takes `--base` to force a single underlying
+module for A/B; `best_base()` is the per-shape mix that produces the `Result` headline.
+**Gotcha:** env is read at import and the `SmemAllocator` finalizes once per process, so each
+seqlen class must be built in a fresh process — the driver forks one per (level, seqlen).
 
 ## Ready / cheap unbenchmarked variants
 
 These modules exist in `kernels/` but were **never measured against the current best**
-(`_ck_log2dom` dispatch). Each is a candidate A/B that could be wired into `LEVELS`:
+(`best_base()` per-seqlen base dispatch). Each is a candidate A/B that could be wired into
+`LEVELS`:
 
 | module | what it is |
 |--------|-----------|
@@ -223,8 +252,13 @@ These modules exist in `kernels/` but were **never measured against the current 
 
 ## Dead ends (reverted — kept so they aren't re-tried)
 
+Measured **this session** (2026-06-18), top group; pre-existing below.
+
 | lever | why |
 |-------|-----|
+| **F2 vectorized score-descale** (`v_pk_mul` via `fx.Vector` + `from_elements`, pack 16 scalar muls) | correct (err 0.039) but **109 TF vs hk5 128 @ sq16384 — regression**; the `from_elements` assembly adds VGPR/moves that outweigh the saved scalar muls (variant `kernels/fmha_prefill_fp8_vdescale.py`, worktree `fmha-vdescale-d3eda332`) |
+| **F4 partial `lgkmcnt(2)`** in the ds_bpermute P-transpose (relax the full LDS drain) | correct (err 0.039/0.043) but **129 TF vs hk5 128 — neutral**; the full drain wasn't a binding stall (`kernels/fmha_prefill_fp8_waitcnt.py`, worktree `fmha-waitcnt-785de923`) |
+| **F3 K=32 atom** `mfma_f32_16x16x32_fp8_fp8` | NOT built — it is a *smaller* atom than hk5's 32×32×16 (8192 vs 16384 MAC/inst), so it would **double the MFMA instruction count** and worsen the softmax cross-lane reduction (2 butterflies vs 1). Structural non-win (scaffold `kernels/fmha_prefill_fp8_mfma16.py`) |
 | XOR swizzle (vs padding) | +27 VGPR, worse occupancy; padding wins |
 | pad + XOR together | no gain over padding alone |
 | split-K | wash / regress (`fmha_prefill_fp8_ck_splitk`) |
@@ -233,12 +267,23 @@ These modules exist in `kernels/` but were **never measured against the current 
 | v6 / v13 2-rep & GEMM2 sw-pipeline | +31 VGPR, no MFMA↔VALU interleave from the scheduler |
 | v14 `v_perm` transpose | no win over ds_bpermute / column-V |
 | KT > 32 (at large seq) | VGPR / occupancy regress (sq16384 116→86) |
+| kdlds K-descale → LDS (at large seq) | regresses sq16384 123→107 (0.85×); kept only as the sq≤2048 base (L9) |
 | ck_async KT=128 + DMA | only 32/35 TF (`fmha_prefill_fp8_ck_async`) |
 | v12 async-on-padded | wrong results (err 2.48); `buffer_load_to_lds` broken in 0.2.0 |
 | hot_loop_scheduler / sched_group_barrier | scheduler interleaves MFMA↔MEM, not MFMA↔VALU |
 | wider 128-bit O store | impossible (output layout) |
 | NWAVES ∈ {2,8} | slower than 4 |
 | maxnreg / waves-per-eu caps | dead in the 0.2.0 wheel |
+
+## Next steps / open frontier
+
+* **K=128 scaled atom `mfma_scale_f32_16x16x128_f8f6f4`** (the MoE-hero-atom analog) — used
+  *unscaled* with exponents pinned to 0 plus our existing post-MFMA descale. It collapses
+  GEMM1's 8 head-dim K-trips to 1 (8→4 MFMAs/subtile), the **highest-ceiling large-seq lever**.
+  Authoring in progress.
+* **Dispatch family for small seq** (sq1024 26 vs CK 30, sq2048 55 vs 62) — the small-seq gap
+  is grid-fill-bound (grid < 80 CU at sq1024). Candidates: **split-KV / flash-decoding** grid
+  filler and a **persistent kernel**.
 
 ## Reproduce
 
@@ -274,4 +319,9 @@ prints the numeric per-level table.
 | `results.tsv` | machine-readable ledger (appended by the driver) |
 | `levels/_build_by_path.py` | kernel loader (import-by-name; path-load for future snapshots) |
 | `levels/README.md` | level → module/env mapping; why no snapshot files are needed |
-| `../kernels/fmha_prefill_fp8_ck_log2dom.py` | the measured-peak underlying kernel (L13 base) |
+| `../kernels/fmha_prefill_fp8_dispatch.py` | **production current best** — `best_base()` per-seqlen base dispatch (log2dom ≤2048, hk5 ≥16384) |
+| `../kernels/fmha_prefill_fp8_ck_hk5.py` | LDS-padded base (L8); the large-seq peak |
+| `../kernels/fmha_prefill_fp8_ck_log2dom.py` | log2-domain base (L10); the small-seq base |
+| `../kernels/fmha_prefill_fp8_vdescale.py` | F2 vectorized score-descale (dead end — regression) |
+| `../kernels/fmha_prefill_fp8_waitcnt.py` | F4 partial `lgkmcnt(2)` P-transpose drain (dead end — neutral) |
+| `../kernels/fmha_prefill_fp8_mfma16.py` | F3 K=32 atom scaffold (structural non-win, not built) |
