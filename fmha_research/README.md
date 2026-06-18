@@ -259,6 +259,9 @@ Measured **this session** (2026-06-18), top group; pre-existing below.
 | **F2 vectorized score-descale** (`v_pk_mul` via `fx.Vector` + `from_elements`, pack 16 scalar muls) | correct (err 0.039) but **109 TF vs hk5 128 @ sq16384 — regression**; the `from_elements` assembly adds VGPR/moves that outweigh the saved scalar muls (variant `kernels/fmha_prefill_fp8_vdescale.py`, worktree `fmha-vdescale-d3eda332`) |
 | **F4 partial `lgkmcnt(2)`** in the ds_bpermute P-transpose (relax the full LDS drain) | correct (err 0.039/0.043) but **129 TF vs hk5 128 — neutral**; the full drain wasn't a binding stall (`kernels/fmha_prefill_fp8_waitcnt.py`, worktree `fmha-waitcnt-785de923`) |
 | **F3 K=32 atom** `mfma_f32_16x16x32_fp8_fp8` | NOT built — it is a *smaller* atom than hk5's 32×32×16 (8192 vs 16384 MAC/inst), so it would **double the MFMA instruction count** and worsen the softmax cross-lane reduction (2 butterflies vs 1). Structural non-win (scaffold `kernels/fmha_prefill_fp8_mfma16.py`) |
+| **K=128 scaled atom** `mfma_scale_f32_16x16x128_f8f6f4` | **gfx950/CDNA4-only** — wired only in `CDNA4/MmaAtom.cpp` (OCP `Float8E4M3FN`, not gfx942's E4M3FNUZ); no gfx942 selection pattern, cannot run on MI308X. The widest gfx942 fp8 atom (32×32×16) is already in use (scaffold `kernels/fmha_prefill_fp8_mfma128.py`) |
+| **split-KV / flash-decoding** (S=2 on log2dom, grid 64→128, fused FlyDSL combine) | correct (err 0.043/0.047) but **device-fair 20/43 TF vs 26/55 @ sq1024/2048 — regression**; the combine pass (8192/16384 wg) + per-split Q-reload/prologue exceeds the CU-fill gain, and the VALU-bound kernel amortizes softmax over fewer MFMAs (`kernels/fmha_prefill_fp8_splitkv.py`, worktree `splitkv-57c5be53`). Refines `ck_splitk`, same verdict |
+| **persistent kernel** (small seq) | provable no-op: sq1024/2048 grid (64 items) ≤ 80 CUs so it is not oversubscribed; wall-time is floored by the single heaviest *indivisible* q-tile, and per-launch overhead is already removed by the graph-replay metric (`kernels/fmha_prefill_fp8_persist.py`, worktree `persist-fmha-9d371c3e`) |
 | XOR swizzle (vs padding) | +27 VGPR, worse occupancy; padding wins |
 | pad + XOR together | no gain over padding alone |
 | split-K | wash / regress (`fmha_prefill_fp8_ck_splitk`) |
@@ -275,15 +278,23 @@ Measured **this session** (2026-06-18), top group; pre-existing below.
 | NWAVES ∈ {2,8} | slower than 4 |
 | maxnreg / waves-per-eu caps | dead in the 0.2.0 wheel |
 
-## Next steps / open frontier
+## Status / remaining gap (structural ceiling reached)
 
-* **K=128 scaled atom `mfma_scale_f32_16x16x128_f8f6f4`** (the MoE-hero-atom analog) — used
-  *unscaled* with exponents pinned to 0 plus our existing post-MFMA descale. It collapses
-  GEMM1's 8 head-dim K-trips to 1 (8→4 MFMAs/subtile), the **highest-ceiling large-seq lever**.
-  Authoring in progress.
-* **Dispatch family for small seq** (sq1024 26 vs CK 30, sq2048 55 vs 62) — the small-seq gap
-  is grid-fill-bound (grid < 80 CU at sq1024). Candidates: **split-KV / flash-decoding** grid
-  filler and a **persistent kernel**.
+All DSL/wheel levers are measured and exhausted (the dead-ends above). Current best =
+per-seqlen-base dispatch **26 / 55 / 129 / 142 TF** vs CK-Tile 30/62/141/146 (**0.87–0.97×**).
+The residual is the structural ceiling for FlyDSL 0.2.0 on gfx942, confirmed by ISA
+(hk5 @ sq16384: VGPR **157 → 3 waves/SIMD**, VALU:MFMA **~36:1**, 0 spills, LDS 18.9 KB):
+
+* **Large seq** — VALU/softmax-bound with no independent MFMA to hide it. The MFMA axis is
+  exhausted (widest gfx942 fp8 atom 32×32×16 already used; K=128 is gfx950-only), and the only
+  occupancy lever (`maxnreg`/waves-per-eu, to reach 4 waves) is dead in the wheel.
+* **Small seq** — grid-fill-bound (grid < 80 CU at sq1024), but both grid-fill levers are
+  measured dead: split-KV regresses (combine + per-split overhead), persistent is a no-op
+  under graph-replay (grid not oversubscribed).
+
+Closing the last gap requires capabilities **outside the DSL/wheel**: gfx950 (the K=128 scaled
+atom) or external-LLVM occupancy control — the same structural residual the `fused_mega_moe`
+example hit at small batch.
 
 ## Reproduce
 
