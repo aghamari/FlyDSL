@@ -678,7 +678,7 @@ def combine_kernel(
         lsum = lsum + e * l_list[s]
         os_idx = (ml_base + fx.Int32(s)) * fx.Int32(HD) + d0
         o4 = fx.Vector(fx.buffer_ops.buffer_load(ros, os_idx, vec_width=4, dtype=fx.Float32))
-        for j in range(4):
+        for j in fx.range_constexpr(4):
             acc[j] = acc[j] + e * fx.Float32(o4[j])
 
     l_is_zero = lsum < fx.Float32(1.0e-30)
