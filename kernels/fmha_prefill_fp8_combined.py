@@ -68,7 +68,7 @@ KVG = KT // 16  # column-V: kv-groups-of-16 per d (HD*KVG == NSLOT)
 NPASS = (NSLOT + NTHREADS - 1) // NTHREADS
 LOG2E = 1.4426950408889634
 
-_alloc = SmemAllocator(None, arch="gfx942", global_sym_name="fmha_prefill_fp8_ck_hk5_smem")
+_alloc = SmemAllocator(None, arch="gfx942", global_sym_name="fmha_prefill_fp8_combined_smem")
 # HK5 — LDS BANK-CONFLICT FIX via row PADDING. Measured baseline: SQ_LDS_BANK_CONFLICT = 68% of busy
 # cycles. Cause: K LDS rows have stride HD=128 bytes = 32 banks*4B, so consecutive kv rows alias to
 # the SAME bank (up to 32-way conflict on the ds_read). Same for V (stride KT). Fix: pad each LDS row
@@ -83,9 +83,11 @@ _K_LDSW = HD + _K_PAD  # K LDS row width (bytes/elements, fp8=1B)
 _V_LDSW = KT + _V_PAD  # V LDS row width
 _K_BYTES = KT * _K_LDSW  # K tile [KT kv x (HD+pad)]
 _V_BYTES = HD * _V_LDSW  # V tile [HD d x (KT+pad)]
+_KD_BYTES = KT * 4  # K descale tile [KT] as f32, ping-ponged with K/V LDS (kdlds win, ported from log2dom)
 _K_OFF = 0
 _V_OFF = _K_OFF + NBUF * _K_BYTES
-_alloc.ptr = _V_OFF + NBUF * _V_BYTES
+_KD_OFF = _V_OFF + NBUF * _V_BYTES
+_alloc.ptr = _KD_OFF + NBUF * _KD_BYTES
 
 
 def const_expr(x):
@@ -216,6 +218,7 @@ def attn_kernel(
 
     k_lds = SmemPtr(_alloc.get_base(), _K_OFF, fx.typing.T.i8, shape=(NBUF * _K_BYTES,)).get()
     vt_lds = SmemPtr(_alloc.get_base(), _V_OFF, fx.typing.T.i8, shape=(NBUF * _V_BYTES,)).get()
+    kd_lds = SmemPtr(_alloc.get_base(), _KD_OFF, fx.typing.T.f32, shape=(NBUF * KT,)).get()
     if const_expr(BUFK):
         k_lds_base = memref.extract_aligned_pointer_as_index(k_lds)
         k_lds_ptr_base = fx.buffer_ops.create_llvm_ptr(arith.index_cast(fx.typing.T.i64, k_lds_base), address_space=3)
@@ -276,7 +279,7 @@ def attn_kernel(
             vc_words.append(fx.buffer_ops.buffer_load(rv, vc_vidx // fx.Int32(4), vec_width=4, dtype=fx.Int32))
         return kc, vc_words
 
-    def store_kv_to_lds(kc, vc_words, kbuf_off, vbuf_off):
+    def store_kv_to_lds(kc, vc_words, kv0_, kbuf_off, vbuf_off, kdbuf_off):
         for p in fx.range_constexpr(NPASS):
             guard = pass_valid[p] if const_expr(NPASS > 1) else None
             kv_row = pass_kv[p]
@@ -308,6 +311,15 @@ def attn_kernel(
                     _do_store()
             else:
                 _do_store()
+
+        # kdlds (ported from log2dom): stage this KT tile's K descales into LDS once, so the
+        # inner-loop score scaling reads LDS instead of a late per-subtile VMEM buffer_load.
+        kd_g = tid
+        if kd_g < fx.Int32(KT // 4):
+            kv_g0 = kv0_ + kd_g * fx.Int32(4)
+            kv_g0_safe = (kv_g0 + fx.Int32(3) < sk_i).select(kv_g0, fx.Int32(0))
+            kd_vec = fx.buffer_ops.buffer_load(rkd, kd_row_base + kv_g0_safe, vec_width=4, dtype=fx.Float32)
+            fx.Vector(kd_vec).store(kd_lds, [fx.Index(kdbuf_off + kd_g * fx.Int32(4))])
 
     def _cvt4(v0, v1, v2, v3):
         lo = fx.rocdl.cvt_pk_fp8_f32(fx.typing.T.i32, fx.Float32(v0).ir_value(), fx.Float32(v1).ir_value(), fx.Int32(0).ir_value(), False)
@@ -368,7 +380,7 @@ def attn_kernel(
         # the scheduler can fill the MFMA unit during the softmax VALU = in-wave overlap), then a
         # single max/corr/rescale, then all GEMM2 MFMAs. Amortises the 64-wide o_acc rescale +
         # max-reduction over NSUB subtiles. NSUB=1 degenerates to the plain online step.
-        def compute_kt_tile(kv0_outer, kbuf, vbuf, m_run, l_run, o_acc, do_mask):
+        def compute_kt_tile(kv0_outer, kbuf, vbuf, kdbuf, m_run, l_run, o_acc, do_mask):
             # --- GEMM1 for all subtiles: S[kv,q] = K @ Q^T ---
             sv = []
             for sub in fx.range_constexpr(NSUB):
@@ -391,10 +403,10 @@ def attn_kernel(
                 kv0 = kv0_outer + fx.Int32(sub * BN)
                 kdv = []
                 for g in fx.range_constexpr(4):
-                    kv_g0 = kv0 + fx.Int32(g * 8) + half * fx.Int32(4)
-                    if const_expr(do_mask):
-                        kv_g0 = (kv_g0 + fx.Int32(3) < sk_i).select(kv_g0, fx.Int32(0))
-                    kdv.append(fx.Vector(fx.buffer_ops.buffer_load(rkd, kd_row_base + kv_g0, vec_width=4, dtype=fx.Float32)))
+                    # kdlds (ported from log2dom): read K descales from the LDS-staged tile
+                    # instead of a per-subtile VMEM buffer_load off the score-scaling critical path.
+                    kd_lds_elem = kdbuf + fx.Int32(sub * BN) + fx.Int32(g * 8) + half * fx.Int32(4)
+                    kdv.append(fx.Vector.load(fx.typing.T.vec(4, fx.typing.T.f32), kd_lds, [fx.Index(kd_lds_elem)]))
                 s_sub = []
                 for i in fx.range_constexpr(16):
                     s = sv[sub][i] * (qs * kdv[i // 4][i % 4])
@@ -482,14 +494,16 @@ def attn_kernel(
             cur_buf = fx.Int32(kt_iv) % fx.Int32(2)
             kbuf = cur_buf * fx.Int32(_K_BYTES)
             vbuf = cur_buf * fx.Int32(_V_BYTES)
+            kdbuf = cur_buf * fx.Int32(KT)
             nxt_buf = (fx.Int32(kt_iv) + fx.Int32(1)) % fx.Int32(2)
             kbuf_n = nxt_buf * fx.Int32(_K_BYTES)
             vbuf_n = nxt_buf * fx.Int32(_V_BYTES)
+            kdbuf_n = nxt_buf * fx.Int32(KT)
             kc_w_next, vc_w_next = load_kv_regs(kv0_outer + fx.Int32(KT))  # OPT3 prefetch
             fx.rocdl.s_setprio(1)
-            m_run, l_run, o_acc = compute_kt_tile(kv0_outer, kbuf, vbuf, m_run, l_run, o_acc, do_mask)
+            m_run, l_run, o_acc = compute_kt_tile(kv0_outer, kbuf, vbuf, kdbuf, m_run, l_run, o_acc, do_mask)
             fx.rocdl.s_setprio(0)
-            store_kv_to_lds(kc_w_next, vc_w_next, kbuf_n, vbuf_n)
+            store_kv_to_lds(kc_w_next, vc_w_next, kv0_outer + fx.Int32(KT), kbuf_n, vbuf_n, kdbuf_n)
             if const_expr(BUFK):
                 _wait_vmem()
             fx.gpu.barrier()
@@ -497,7 +511,7 @@ def attn_kernel(
 
         # Prologue: stage outer tile 0 into LDS buffer 0.
         kc_w0, vc_w0 = load_kv_regs(fx.Int32(0))
-        store_kv_to_lds(kc_w0, vc_w0, fx.Int32(0), fx.Int32(0))
+        store_kv_to_lds(kc_w0, vc_w0, fx.Int32(0), fx.Int32(0), fx.Int32(0), fx.Int32(0))
         if const_expr(BUFK):
             _wait_vmem()
         fx.gpu.barrier()

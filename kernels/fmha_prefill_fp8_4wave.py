@@ -68,7 +68,7 @@ KVG = KT // 16  # column-V: kv-groups-of-16 per d (HD*KVG == NSLOT)
 NPASS = (NSLOT + NTHREADS - 1) // NTHREADS
 LOG2E = 1.4426950408889634
 
-_alloc = SmemAllocator(None, arch="gfx942", global_sym_name="fmha_prefill_fp8_ck_hk5_smem")
+_alloc = SmemAllocator(None, arch="gfx942", global_sym_name="fmha_prefill_fp8_4wave_smem")
 # HK5 — LDS BANK-CONFLICT FIX via row PADDING. Measured baseline: SQ_LDS_BANK_CONFLICT = 68% of busy
 # cycles. Cause: K LDS rows have stride HD=128 bytes = 32 banks*4B, so consecutive kv rows alias to
 # the SAME bank (up to 32-way conflict on the ds_read). Same for V (stride KT). Fix: pad each LDS row

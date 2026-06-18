@@ -41,7 +41,7 @@ sys.path.insert(0, "tests/kernels")
 sys.path.insert(0, "kernels")
 import torch
 import fmha_prefill_fp8_ref as R
-import fmha_prefill_fp8_v8 as K  # canonical shipping kernel: per-shape dispatch (base <=sq1024, diagonal-pair above)
+import fmha_prefill_fp8_layout as K  # canonical shipping kernel: make_mma_atom layout rewrite (column-major V)
 
 b, sq, sk, nk, gqa, causal, ps, pscale = (
     int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]),
@@ -57,7 +57,7 @@ v = torch.randn(b, sk, nk, HD)
 qf, qd = R.quantize_per_token_head(q)
 kf, kd = R.quantize_per_token_head(k)
 vf, vd = R.quantize_per_head(v)
-cache = R.pack_paged_cache(kf, vf, ps, scatter=True)
+cache = R.pack_paged_cache(kf, vf, ps, scatter=True, v_col=getattr(K, "V_COL", False))
 LTDg = cache.page_ids.to("cuda")
 LTPg = cache.kv_indptr.to("cuda")
 Kpool = cache.k_pool.view(torch.float8_e4m3fnuz).to("cuda")
@@ -84,7 +84,7 @@ def test_fmha_prefill_fp8(case):
         cwd=str(_REPO),
         capture_output=True,
         text=True,
-        env={"HIP_VISIBLE_DEVICES": "2", "PATH": "/usr/bin:/bin:/opt/rocm/bin"},
+        env={"HIP_VISIBLE_DEVICES": "6", "PATH": "/usr/bin:/bin:/opt/rocm/bin"},
         timeout=600,
     )
     out = proc.stdout + proc.stderr

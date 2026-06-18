@@ -1,13 +1,99 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FP8 causal FMHA prefill (paged, vec_k_col_v) for gfx942 — CK-Tile-structured FlyDSL port.
+"""FP8 causal FMHA prefill (paged, vec_k_col_v) for gfx942 — IDIOMATIC layout-API rewrite.
 
-★ Canonical FlyDSL FMHA kernel. Full design notes, perf history, the VALU-fold/COLUMN-V wins,
-occupancy diagnosis, and the dead-end ledger live in ``learn_fmha/docs/JOURNAL.md`` §2–3.
+★ READABILITY REWRITE of ``fmha_prefill_fp8_ck_log2dom.py`` (the current-best kernel). Functionally
+identical (same ``run_attn`` signature, same features) but the two GEMMs are expressed through the
+FlyDSL MMA *atom* API (``fx.make_mma_atom(fx.rocdl.MFMA(32, 32, 16, fp8))`` +
+``fly.mma_atom_call_ssa``) instead of the raw ``fx.rocdl.mfma_f32_32x32x16_fp8_fp8`` intrinsic, so the
+MFMA shape/dtype is declared once as a typed atom and reused. This matches the only other fp8
+attention kernel in the tree (``flash_attn_gfx950.py``), which also drives the chained attention MFMAs
+through ``make_mma_atom`` + ``mma_atom_call_ssa`` rather than ``fx.gemm``.
+
+★ HYBRID SCOPE — what is layout-API vs what stays DIRECT, and WHY (per the flydsl-layout-algebra
+skill's "Layout Algebra vs Direct Indexing" decision table):
+  CONVERTED to layout-API:
+    * The two GEMMs -> typed ``fx.make_mma_atom`` + ``mma_atom_call_ssa`` (declares the 32x32x16 fp8
+      MFMA once; the call sites read as a matmul op, not a packed intrinsic).
+  KEPT DIRECT (skill says algebra does NOT fit — converting would regress or silently break):
+    * fx.gemm / make_tiled_mma / make_fragment_A/B/C: CANNOT express the chained attention GEMMs.
+      GEMM1's C-output lane layout differs from GEMM2's B-operand layout (the skill's chained-MFMA
+      trap); the existing ds_bpermute P-transpose is the bespoke fix for that exact lane mismatch.
+      ``fx.gemm`` assumes a regular tiled_copy A/B/C feed and has no hook for the scattered ds_bpermute
+      P-feed, so it cannot reproduce the lane dataflow. (flash_attn_gfx950.py reaches the same verdict.)
+    * make_buffer_tensor + layout views for the globals: the K/V access is a PAGED jagged gather
+      (page-table lookup via LTD/LTP, then ``kphys*stride + head_off + ...`` byte arithmetic). The skill
+      says jagged/gather addressing stays on direct ``create_buffer_resource`` + ``buffer_load`` — a
+      layout view cannot index a gather. (CLAUDE.md prefers make_buffer_tensor for *regular* globals;
+      none of these are regular.)
+    * online softmax, P-transpose (ds_bpermute + cvt_pk_fp8), hand LDS row padding, diagonal-pair grid
+      + causal bound math: bespoke register packing / swizzle / reductions — direct per the skill.
+
+Original kernel notes (unchanged below) follow.
+----
+= hk5 (ck + LDS padding) + three stacked
+VALU wins: kdlds (K-descale staged in LDS, off the score-scaling critical path), exp-bias hoist
+(per-tile exp constant folded), and LOG2E-into-descale (whole score domain in log2 units, removing the
+per-element *LOG2E). Device-fair (rocprof / bench_fmha_fair.py, NOT do_bench which adds ~0.3ms host
+overhead) it reaches ~109/129 TF graph-timed (116/131 rocprof) @ sq16384/32768 vs hk5 103/122.
+
+★ PER-SHAPE DISPATCH (KT and DIAG are compile-time consts -> pick the build per seqlen):
+    sq<=1024 : FMHA_KT=64 FMHA_DIAG=0   -> 26 TF  (CK-Tile 29, gap 1.12x)
+    sq~2048  : FMHA_KT=64 FMHA_DIAG=1   -> 55 TF  (CK-Tile 62, gap 1.13x)
+    sq>=16384: FMHA_KT=32 FMHA_DIAG=1   -> 116/131 (CK-Tile 141/145, gap 1.22x/1.11x)
+KT=64 amortizes softmax VALU better at SMALL seq but REGRESSES large seq (sq16384 116->86), so it must
+stay per-shape. Remaining ~1.1-1.22x gap to CK is the 0.2.0-scheduler structural wall (won't fill the
+softmax exp shadow with independent MFMA; confirmed by 4 parallel-agent attempts — see memory
+feedback-fmha-perf-lessons). For the LDS-padding bank-conflict diagnosis see ck_hk5.
+
+This is a FRESH kernel modeled on AMD's CK-Tile ``BlockFmhaBatchPrefillPipelineQRKSVSAsync``
+(the production fp8 batch-prefill pipeline reached through aiter), NOT on the PyISA kernel that
+``fmha_prefill_fp8_8wave.py`` ports. It keeps full feature parity with the 8wave/v8 baselines
+(identical ``run_attn`` signature and tensor layouts, so the existing tests/bench are drop-in)
+but adopts CK's structural choices:
+
+  * **Large outer K-tile** ``KT`` (CK's ``kN0``) instead of the 8wave 32-kv tile: one cooperative
+    load + one ``gpu.barrier()`` + one prefetch issue per ``KT`` keys (amortised over ``NSUB``
+    MFMA subtiles).
+  * **Q loaded once** into registers and reused across the whole KV loop (CK ``kQLoadOnce``).
+  * **Async global->LDS prefetch** path (``buffer_load_to_lds``, env ``FMHA_BUFK``).
+  * **Diagonal-pair tiling** (CK's causal load-balancer / reversed tile partitioner): each CTA
+    does q-tile ``t`` and its causal mirror ``num_q_tiles-1-t`` (env ``FMHA_DIAG``, default on).
+
+Compute per subtile reuses the validated 8wave online-softmax recurrence (register-resident P
+transposed via ``ds_bpermute``, fast ``rocdl.exp2``, per-token-head Q/K descale, per-head V
+descale, ``p_scale``) so correctness matches the baseline; the experiments are purely structural.
+
+GEMMs use ``mfma_f32_32x32x16_fp8_fp8``. GEMM1 = K@Qᵀ (S as [kv,q]); GEMM2 = Vᵀ@P (O as [d,q]).
 
 Tunables (env): FMHA_NWAVES (waves/wg, default 4 -> TILE_BM=128), FMHA_KT (outer kv tile,
 default 32), FMHA_VCOL (column-V, default 1), FMHA_DIAG (diagonal-pair, default 1),
-FMHA_XCD (chiplet block-ID remap, default 1; FMHA_XCD_C grouping, default 4),
 FMHA_BUFK (async K DMA, default 0 -- broken in this wheel).
+
+PERF (MI308X gfx942, flydsl 0.2.0), bs=1 nq8 nk1 causal, TFLOPS @ sq 1024/2048/16384/32768:
+    this kernel  5 / 16 / 61 / 69      (VGPR 165, LDS 16 KB, 0 spills)
+    v8 baseline  5 / 15 / 50 / 57
+    CK-Tile fp8  30 / 62 / 141 / 145
+=> +22% over the best prior FlyDSL kernel at large seq; still ~2.1x behind CK at large seq.
+
+KEY WIN -- COLUMN-V (VCOL): CK's true vec_k_col_v stores V column-major so the GEMM2 contraction
+dim (kv) is contiguous => NO transpose. We match it (pack_paged_cache(v_col=True)); the V->LDS
+copy is one 128-bit store/slot instead of the 16x ds_write_b8 scatter the row-major path needs.
+PMC: LDS-wait 54% -> 18% of busy cycles. This DISPROVES the handoff's claim that the gfx942
+transpose DS-wait is irreducible / needs gfx950 ds_read_tr -- CK avoids it purely by V layout, and
+so do we. Second win: masked/unmasked loop split (CK does this) -- interior tiles skip the
+per-element causal-mask VALU (VALU:MFMA 24->19, +13%).
+
+REMAINING GAP (~2.1x) is VALU/scheduling-bound, not memory or transpose:
+  * VALU:MFMA ~19:1; the softmax VALU sits between the two MFMA bursts with no independent MFMA to
+    hide it. Overlapping it needs cross-tile software pipelining with INDEPENDENT MFMA streams.
+  * FlyDSL 0.2.0's scheduler does NOT auto-overlap MFMA with VALU (batched GEMM1+softmax, bigger
+    KT, and arith.maxnumf-vs-maximumf all failed to help or regressed); occupancy is VGPR-pinned
+    at 3 waves/SIMD and workgroup-size tuning didn't move it.
+  * buffer_load_to_lds (would free VGPR for a big tile) is BROKEN (wrong results; v12 too).
+DEAD-ENDS here: KT>32 (VGPR/occupancy regress), batched-within-tile overlap (no scheduler help),
+maxnumf (slower despite fewer ops), NWAVES!=4. Next levers to reach 145: manual cross-tile
+pipeline interleaving independent GEMM1(i+1) MFMAs into softmax(i) VALU; external-LLVM VGPR cap
+for 4 waves/SIMD; a fixed buffer_load_to_lds; or gfx950 ds_read_tr.
 """
 
 import os
@@ -15,7 +101,7 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith, memref
+from flydsl._mlir.dialects import arith, fly, memref
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
@@ -52,23 +138,12 @@ BUFK = int(os.environ.get("FMHA_BUFK", "0")) != 0
 VCOL = int(os.environ.get("FMHA_VCOL", "1")) != 0
 V_COL = VCOL  # consumed by ck_check.py / bench_fmha_compare.py to pack the matching V pool
 
-# XCD/chiplet block-ID remap (HipKittens Algorithm 1, phase-1 grouping). MI308X = 4 XCDs; HW routes
-# physical block b -> XCD (b % NXCD). Invert that round-robin so XCD_C consecutive *logical* blocks
-# (ordered qhead-fast => all GQA q-heads of one q-tile share the identical causal K/V range) land on
-# the SAME XCD's private L2. MEASURED (MI308X, bs1 nq8 nk1 causal): C=4 lifts sq16384 110->117 TF and
-# sq32768 138->140, with L2 misses 1.92M->1.70M (hit 95.1%->95.7%) on the single profiled launch. The
-# gain is small because the kernel is VALU-bound (mem off the critical path); C in {3,4,5} all tie.
-# Default ON with C=4. FMHA_XCD=0 restores the flat grid.
-NXCD = int(os.environ.get("FMHA_NXCD", "4"))
-XCD_REMAP = int(os.environ.get("FMHA_XCD", "1")) != 0
-XCD_C = int(os.environ.get("FMHA_XCD_C", "4"))  # blocks grouped onto one XCD (knob C)
-
 NSLOT = KT * 8  # KT kv x 8 feature-groups of 16 fp8 = 16B slots per tile (same count K and V)
 KVG = KT // 16  # column-V: kv-groups-of-16 per d (HD*KVG == NSLOT)
 NPASS = (NSLOT + NTHREADS - 1) // NTHREADS
 LOG2E = 1.4426950408889634
 
-_alloc = SmemAllocator(None, arch="gfx942", global_sym_name="fmha_prefill_fp8_ck_hk5_smem")
+_alloc = SmemAllocator(None, arch="gfx942", global_sym_name="fmha_prefill_fp8_reorder_smem")
 # HK5 — LDS BANK-CONFLICT FIX via row PADDING. Measured baseline: SQ_LDS_BANK_CONFLICT = 68% of busy
 # cycles. Cause: K LDS rows have stride HD=128 bytes = 32 banks*4B, so consecutive kv rows alias to
 # the SAME bank (up to 32-way conflict on the ds_read). Same for V (stride KT). Fix: pad each LDS row
@@ -83,9 +158,11 @@ _K_LDSW = HD + _K_PAD  # K LDS row width (bytes/elements, fp8=1B)
 _V_LDSW = KT + _V_PAD  # V LDS row width
 _K_BYTES = KT * _K_LDSW  # K tile [KT kv x (HD+pad)]
 _V_BYTES = HD * _V_LDSW  # V tile [HD d x (KT+pad)]
+_KD_BYTES = KT * 4  # K descale tile [KT] as f32, ping-ponged with K/V LDS buffers
 _K_OFF = 0
 _V_OFF = _K_OFF + NBUF * _K_BYTES
-_alloc.ptr = _V_OFF + NBUF * _V_BYTES
+_KD_OFF = _V_OFF + NBUF * _V_BYTES
+_alloc.ptr = _KD_OFF + NBUF * _KD_BYTES
 
 
 def const_expr(x):
@@ -106,8 +183,6 @@ _VMCNT0 = 0x3F70
 
 def _wait_vmem():
     fx.rocdl.s_waitcnt(_VMCNT0)
-
-
 
 
 @flyc.kernel(known_block_size=[NTHREADS, 1, 1])
@@ -147,31 +222,10 @@ def attn_kernel(
         num_first = (num_q_tiles + fx.Int32(1)) // fx.Int32(2)
     else:
         num_first = num_q_tiles
-    if const_expr(XCD_REMAP):
-        # Invert HW round-robin (blk -> XCD blk%NXCD) so XCD_C consecutive logical ids land on one XCD.
-        # Remap is a bijection only over the prefix of FULL NXCD*XCD_C chunks; the partial tail
-        # (the last gridDim % (NXCD*XCD_C) blocks) keeps the identity map so the whole map stays a
-        # permutation of [0, gridDim) -> no logical tile dropped/duplicated.
-        gdim = fx.Int32(fx.grid_dim.x)
-        chunk_span = fx.Int32(NXCD * XCD_C)
-        n_full = (gdim // chunk_span) * chunk_span
-        xcd = blk % fx.Int32(NXCD)
-        local = blk // fx.Int32(NXCD)
-        chunk_idx = local // fx.Int32(XCD_C)
-        pos = local % fx.Int32(XCD_C)
-        lblk_r = chunk_idx * chunk_span + xcd * fx.Int32(XCD_C) + pos
-        lblk = (blk < n_full).select(lblk_r, blk)
-        # Decode QHEAD-FAST: lblk = (batch*num_first + first_idx)*nq + qhead, so an XCD chunk shares
-        # the same first_idx (== same causal K/V range) across the GQA q-heads.
-        qhead = fx.Int32(lblk % fx.Int32(nq))
-        tmp = lblk // fx.Int32(nq)
-        first_idx = fx.Int32(tmp % num_first)
-        batch = fx.Int32(tmp // num_first)
-    else:
-        first_idx = blk % num_first
-        tmp = blk // num_first
-        qhead = tmp % fx.Int32(nq)
-        batch = tmp // fx.Int32(nq)
+    first_idx = blk % num_first
+    tmp = blk // num_first
+    qhead = tmp % fx.Int32(nq)
+    batch = tmp // fx.Int32(nq)
     kvhead = qhead // fx.Int32(gqa)
 
     q_local = lane % fx.Int32(32)
@@ -208,14 +262,22 @@ def attn_kernel(
     f32t = fx.typing.T.f32
     _ar = fx.arith.unwrap
 
-    def _fmax(a, b):
-        # maxnum (non-NaN-propagating) fuses into v_max3_f32 (3-input max), halving the softmax
-        # reduction VALU; the DSL's maximumf -> llvm.maximum.f32 does NOT fuse. Softmax max needs
-        # no NaN propagation (scores are finite or -inf). CK uses maxnum (v_max3) too.
-        return fx.Float32(arith.maxnumf(_ar(a), _ar(b)))
+    # IDIOMATIC: declare the 32x32x16 fp8 MFMA ONCE as a typed layout-API atom (vs repeating the
+    # raw `rocdl.mfma_f32_32x32x16_fp8_fp8` intrinsic at each GEMM site). Same pattern as the only
+    # other fp8 attention kernel in-tree (flash_attn_gfx950.py): make_mma_atom + fly.mma_atom_call_ssa.
+    # The operands are the SAME packed-fp8 i64 / v16f32 acc as before, so the lane dataflow (and the
+    # ds_bpermute P-transpose feeding GEMM2) is unchanged — this is a readability swap, not a re-layout.
+    _mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(32, 32, 16, fx.typing.T.f8))
+
+    def _mfma(a, b, c):
+        a_raw = a.ir_value() if hasattr(a, "ir_value") else a
+        b_raw = b.ir_value() if hasattr(b, "ir_value") else b
+        c_raw = c.ir_value() if hasattr(c, "ir_value") else c
+        return fly.mma_atom_call_ssa([f32x16], _mma_atom, a_raw, b_raw, c_raw)
 
     k_lds = SmemPtr(_alloc.get_base(), _K_OFF, fx.typing.T.i8, shape=(NBUF * _K_BYTES,)).get()
     vt_lds = SmemPtr(_alloc.get_base(), _V_OFF, fx.typing.T.i8, shape=(NBUF * _V_BYTES,)).get()
+    kd_lds = SmemPtr(_alloc.get_base(), _KD_OFF, fx.typing.T.f32, shape=(NBUF * KT,)).get()
     if const_expr(BUFK):
         k_lds_base = memref.extract_aligned_pointer_as_index(k_lds)
         k_lds_ptr_base = fx.buffer_ops.create_llvm_ptr(arith.index_cast(fx.typing.T.i64, k_lds_base), address_space=3)
@@ -276,7 +338,7 @@ def attn_kernel(
             vc_words.append(fx.buffer_ops.buffer_load(rv, vc_vidx // fx.Int32(4), vec_width=4, dtype=fx.Int32))
         return kc, vc_words
 
-    def store_kv_to_lds(kc, vc_words, kbuf_off, vbuf_off):
+    def store_kv_to_lds(kc, vc_words, kv0_, kbuf_off, vbuf_off, kdbuf_off):
         for p in fx.range_constexpr(NPASS):
             guard = pass_valid[p] if const_expr(NPASS > 1) else None
             kv_row = pass_kv[p]
@@ -308,6 +370,14 @@ def attn_kernel(
                     _do_store()
             else:
                 _do_store()
+
+        # Stage K descales once per KT tile so score scaling consumes LDS instead of late VMEM.
+        kd_g = tid
+        if kd_g < fx.Int32(KT // 4):
+            kv_g0 = kv0_ + kd_g * fx.Int32(4)
+            kv_g0_safe = (kv_g0 + fx.Int32(3) < sk_i).select(kv_g0, fx.Int32(0))
+            kd_vec = fx.buffer_ops.buffer_load(rkd, kd_row_base + kv_g0_safe, vec_width=4, dtype=fx.Float32)
+            fx.Vector(kd_vec).store(kd_lds, [fx.Index(kdbuf_off + kd_g * fx.Int32(4))])
 
     def _cvt4(v0, v1, v2, v3):
         lo = fx.rocdl.cvt_pk_fp8_f32(fx.typing.T.i32, fx.Float32(v0).ir_value(), fx.Float32(v1).ir_value(), fx.Int32(0).ir_value(), False)
@@ -368,7 +438,7 @@ def attn_kernel(
         # the scheduler can fill the MFMA unit during the softmax VALU = in-wave overlap), then a
         # single max/corr/rescale, then all GEMM2 MFMAs. Amortises the 64-wide o_acc rescale +
         # max-reduction over NSUB subtiles. NSUB=1 degenerates to the plain online step.
-        def compute_kt_tile(kv0_outer, kbuf, vbuf, m_run, l_run, o_acc, do_mask):
+        def compute_kt_tile(kv0_outer, kbuf, vbuf, kdbuf, m_run, l_run, o_acc, do_mask):
             # --- GEMM1 for all subtiles: S[kv,q] = K @ Q^T ---
             sv = []
             for sub in fx.range_constexpr(NSUB):
@@ -377,24 +447,24 @@ def attn_kernel(
                     k_lds_elem = kbuf + (fx.Int32(sub * BN) + kv_local) * fx.Int32(_K_LDSW) + fx.Int32(ks * 16) + half * fx.Int32(8)
                     kv8 = fx.Vector.load(fx.typing.T.vec(8, fx.typing.T.i8), k_lds, [fx.Index(k_lds_elem)])
                     k_packs.append(fx.Vector(kv8).bitcast(fx.Int64)[0])
+                fx.rocdl.sched_dsrd(KSTEPS)
                 acc_raw = fx.Vector.filled(16, 0.0, fx.Float32).ir_value()
                 for ks in fx.range_constexpr(KSTEPS):
-                    a_raw = k_packs[ks].ir_value() if hasattr(k_packs[ks], "ir_value") else k_packs[ks]
-                    b_raw = q_i64[ks].ir_value() if hasattr(q_i64[ks], "ir_value") else q_i64[ks]
-                    acc_raw = fx.rocdl.mfma_f32_32x32x16_fp8_fp8(f32x16, a_raw, b_raw, acc_raw, 0, 0, 0).res
+                    acc_raw = _mfma(k_packs[ks], q_i64[ks], acc_raw)  # GEMM1: S = K @ Q^T (typed atom)
+                    fx.rocdl.sched_mfma(1)
                 sv.append(fx.Vector(acc_raw))
 
             # --- descale + causal mask for all subtiles -> s_vals[sub][i] ---
-            qs = q_descale * fx.Float32(sm_scale * LOG2E)  # per-lane const (folds sm AND log2e into descale)
+            # Fold LOG2E into the descale -> whole score domain is in log2 units, so the
+            # per-element exp arg loses its *LOG2E (mul->nothing) and corr loses its mul.
+            qs = q_descale * fx.Float32(sm_scale * LOG2E)  # per-lane const (sm + descale + log2e)
             s_all = []  # flat list over subtiles
             for sub in fx.range_constexpr(NSUB):
                 kv0 = kv0_outer + fx.Int32(sub * BN)
                 kdv = []
                 for g in fx.range_constexpr(4):
-                    kv_g0 = kv0 + fx.Int32(g * 8) + half * fx.Int32(4)
-                    if const_expr(do_mask):
-                        kv_g0 = (kv_g0 + fx.Int32(3) < sk_i).select(kv_g0, fx.Int32(0))
-                    kdv.append(fx.Vector(fx.buffer_ops.buffer_load(rkd, kd_row_base + kv_g0, vec_width=4, dtype=fx.Float32)))
+                    kd_lds_elem = kdbuf + fx.Int32(sub * BN) + fx.Int32(g * 8) + half * fx.Int32(4)
+                    kdv.append(fx.Vector.load(fx.typing.T.vec(4, fx.typing.T.f32), kd_lds, [fx.Index(kd_lds_elem)]))
                 s_sub = []
                 for i in fx.range_constexpr(16):
                     s = sv[sub][i] * (qs * kdv[i // 4][i % 4])
@@ -410,24 +480,24 @@ def attn_kernel(
                 for i in fx.range_constexpr(16):
                     if const_expr(sub == 0 and i == 0):
                         continue
-                    m_loc = _fmax(m_loc, s_all[sub][i])
-            m_loc = _fmax(m_loc, fx.Float32(m_loc.shuffle_xor(off32, width64)))
-            m_new = _fmax(m_run, m_loc)
+                    m_loc = m_loc.maximumf(s_all[sub][i])
+            m_loc = m_loc.maximumf(m_loc.shuffle_xor(off32, width64))
+            m_new = m_run.maximumf(m_loc)
             m_is_neg = m_new < fx.Float32(-1.0e38)
             safe_m = m_is_neg.select(fx.Float32(0.0), m_new)
+            # scores are already in log2 units (LOG2E folded into qs), so no *LOG2E here.
             corr = fx.Float32(fx.rocdl.exp2(f32t, _ar(m_run - safe_m)))
             corr = m_is_neg.select(fx.Float32(0.0), corr)
-            # Fold the loop-invariant p_scale shift into the pivot ONCE (s - safe_m + log2_ps ==
-            # s - (safe_m - log2_ps)), removing one add per softmax element.
-            safe_m_p = safe_m - log2_pscale
 
             # exp + running-sum (per element), then a single rescale of o_acc.
+            # Domain is log2 already: exp arg = s + exp_bias, where exp_bias = log2_pscale - safe_m.
+            exp_bias = fx.Float32(log2_pscale) - safe_m
             l_loc = fx.Float32(0.0)
             p_all = []
             for sub in fx.range_constexpr(NSUB):
                 p_sub = []
                 for i in fx.range_constexpr(16):
-                    p = fx.Float32(fx.rocdl.exp2(f32t, _ar(s_all[sub][i] - safe_m_p)))
+                    p = fx.Float32(fx.rocdl.exp2(f32t, _ar(s_all[sub][i] + exp_bias)))
                     p_sub.append(p)
                     l_loc = l_loc + p
                 p_all.append(p_sub)
@@ -465,14 +535,12 @@ def attn_kernel(
                         v_lds_elem = vbuf + d_col * fx.Int32(_V_LDSW) + fx.Int32(sub * BN) + fx.Int32(s * 16) + half * fx.Int32(8)
                         vv8 = fx.Vector.load(fx.typing.T.vec(8, fx.typing.T.i8), vt_lds, [fx.Index(v_lds_elem)])
                         v_packs.append(fx.Vector(vv8).bitcast(fx.Int64)[0])
+                fx.rocdl.sched_dsrd(DT * 2)
                 for dt in fx.range_constexpr(DT):
                     acc2 = fx.Vector(o_acc[dt]).ir_value()
                     for s in fx.range_constexpr(2):
-                        v_i64 = v_packs[dt * 2 + s]
-                        p_i64 = p_i64_s[s]
-                        a_raw = v_i64.ir_value() if hasattr(v_i64, "ir_value") else v_i64
-                        b_raw = p_i64.ir_value() if hasattr(p_i64, "ir_value") else p_i64
-                        acc2 = fx.rocdl.mfma_f32_32x32x16_fp8_fp8(f32x16, a_raw, b_raw, acc2, 0, 0, 0).res
+                        acc2 = _mfma(v_packs[dt * 2 + s], p_i64_s[s], acc2)  # GEMM2: O = V^T @ P (typed atom)
+                        fx.rocdl.sched_mfma(1)
                     o_acc[dt] = fx.Vector(acc2)
             return m_new, l_run, o_acc
 
@@ -482,14 +550,16 @@ def attn_kernel(
             cur_buf = fx.Int32(kt_iv) % fx.Int32(2)
             kbuf = cur_buf * fx.Int32(_K_BYTES)
             vbuf = cur_buf * fx.Int32(_V_BYTES)
+            kdbuf = cur_buf * fx.Int32(KT)
             nxt_buf = (fx.Int32(kt_iv) + fx.Int32(1)) % fx.Int32(2)
             kbuf_n = nxt_buf * fx.Int32(_K_BYTES)
             vbuf_n = nxt_buf * fx.Int32(_V_BYTES)
+            kdbuf_n = nxt_buf * fx.Int32(KT)
             kc_w_next, vc_w_next = load_kv_regs(kv0_outer + fx.Int32(KT))  # OPT3 prefetch
             fx.rocdl.s_setprio(1)
-            m_run, l_run, o_acc = compute_kt_tile(kv0_outer, kbuf, vbuf, m_run, l_run, o_acc, do_mask)
+            m_run, l_run, o_acc = compute_kt_tile(kv0_outer, kbuf, vbuf, kdbuf, m_run, l_run, o_acc, do_mask)
             fx.rocdl.s_setprio(0)
-            store_kv_to_lds(kc_w_next, vc_w_next, kbuf_n, vbuf_n)
+            store_kv_to_lds(kc_w_next, vc_w_next, kv0_outer + fx.Int32(KT), kbuf_n, vbuf_n, kdbuf_n)
             if const_expr(BUFK):
                 _wait_vmem()
             fx.gpu.barrier()
@@ -497,7 +567,7 @@ def attn_kernel(
 
         # Prologue: stage outer tile 0 into LDS buffer 0.
         kc_w0, vc_w0 = load_kv_regs(fx.Int32(0))
-        store_kv_to_lds(kc_w0, vc_w0, fx.Int32(0), fx.Int32(0))
+        store_kv_to_lds(kc_w0, vc_w0, fx.Int32(0), fx.Int32(0), fx.Int32(0), fx.Int32(0))
         if const_expr(BUFK):
             _wait_vmem()
         fx.gpu.barrier()

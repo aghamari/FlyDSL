@@ -576,3 +576,20 @@ AND a single-buffered/streamed small-LDS V so KT can grow without the 64 KB cap,
 `ds_read_tr`. Column-V should also be ported back into v8 (the production kernel) for the immediate
 +20% there. Artifacts: `tests/kernels/lds_dma_probe.py` (DMA usage proof), `kernels/fmha_prefill_fp8_ck_async.py`
 (correct async kernel, kept for reference).
+
+---
+
+## 12. CANONICAL kernel: `kernels/fmha_prefill_fp8_layout.py` (column-major V)
+
+**`fmha_prefill_fp8_layout` is now the canonical fp8 paged causal FMHA prefill kernel.** It is the
+`make_mma_atom`-based clean rewrite of the log2dom/reorder line and exports `V_COL = True` (needs the
+column-major V pool: `pack_paged_cache(..., v_col=True)`). Perf bs=1 nq8 nk1 causal: **~5 / 18 / 109 /
+128 TF** @ sq 1024 / 2048 / 16384 / 32768 — **~1.8× over the former `fmha_prefill_fp8_ck`** (61/69 @
+16384/32768) and within **~1.13–1.29×** of CK-Tile fp8 (140/145).
+
+**WHY (the real story):** the dominant win was **LDS row-padding** — +8 B/row on the K/V LDS stride —
+which dropped a ~68%→15% LDS **bank-conflict** stall. The previously-claimed "irreducible gfx942
+LDS-wait" (§6.2) was in fact bank conflicts, fixed cheaply by padding. On top: a small softmax-VALU
+cleanup — kdlds (K-descale staged in LDS, off the score-scaling path), exp-bias hoist (per-tile exp
+constant folded), and log2-domain fold (whole score domain in log2 units). Note PyISA uses the same
+`mfma_f32_32x32x16_fp8_fp8` MFMA. Tests/bench now default to this kernel.
