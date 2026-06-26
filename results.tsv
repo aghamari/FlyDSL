@@ -1,0 +1,21 @@
+commit	variant	seqlen	tflops	ms	vgpr	status	description
+baseline	fmha_prefill_fp8_ck_hk5	1024	25	0.0853	157	baseline	hk5 KT64 DIAG0 (large-seq best core)
+baseline	fmha_prefill_fp8_ck_hk5	2048	52	0.1658	157	baseline	hk5 KT64 DIAG1
+baseline	fmha_prefill_fp8_ck_hk5	16384	129	4.2673	157	baseline	hk5 KT32 DIAG0
+baseline	fmha_prefill_fp8_ck_hk5	32768	142	15.509	157	baseline	hk5 KT32 DIAG1
+baseline	fmha_prefill_fp8_ck_log2dom	1024	26	0.0816	-	baseline	log2dom KT64 DIAG0 (small-seq best)
+baseline	fmha_prefill_fp8_ck_log2dom	2048	55	0.1574	-	baseline	log2dom KT64 DIAG1
+baseline	fmha_prefill_fp8_layout	1024	26	0.0814	-	baseline	layout-API (== log2dom): typed mma_atom only
+baseline	fmha_prefill_fp8_layout	2048	55	0.1573	-	baseline	layout-API == log2dom
+baseline	fmha_prefill_fp8_layout	16384	106	5.1962	-	baseline	layout-API == log2dom; kdlds regresses large seq
+baseline	fmha_prefill_fp8_layout	32768	131	16.7408	-	baseline	layout-API == log2dom
+reference	CK-Tile_fp8	1024	30	-	-	target	aiter production
+reference	CK-Tile_fp8	2048	62	-	-	target	aiter production
+reference	CK-Tile_fp8	16384	141	-	-	target	aiter production
+reference	CK-Tile_fp8	32768	146	-	-	target	aiter production
+hs-stageC	fmha_prefill_fp8_hs	16384	105	5.2374	194	discard	cross-tile pipeline + hand-woven GEMM1(t+1) into softmax(t); ERR 0.039 OK; VGPR 157->194 (3->2 waves/SIMD); overlap can't pay for lost wave (lesson-19 register wall)
+hs-stageC	fmha_prefill_fp8_hs	32768	115	19.169	194	discard	same; regresses vs hk5 142
+wpeu	fmha_prefill_fp8_hs	16384	-	-	157	discard	FMHA_WPEU=4 -> "amdgpu-waves-per-eu"="4,4" reaches LLVM IR but embedded gpu-module->binary backend IGNORES it; VGPR stayed 157 (not <=128). Occupancy NOT forceable from Python. Corrects skill ("unreachable"->"reachable-but-ignored").
+hints	fmha_prefill_fp8_hs	16384	128	4.2873	-	discard	FMHA_HINTS=1 (llvm enable-post-misched=False,lsr-drop-solution=True): neutral vs 129
+lazy	fmha_prefill_fp8_hs	16384	128	4.2884	-	discard	FMHA_LAZY=1 (skip o_acc rescale when corr==1 via wave ballot, from flash_attn_gfx950); ERR 0.039 OK; neutral vs 129 (ballot/branch offsets the saved rescale)
+note	CACHE_CONTAMINATION	-	-	-	-	method	FlyDSL disk cache served STALE modules across env-toggled same-name variants (gave bogus 515 TF / spurious 0.076 FAIL @ 32768). MUST run FLYDSL_RUNTIME_ENABLE_CACHE=0 when sweeping env knobs on one module. Cache-clean: hs(HSCHED=0)==hk5 142 TF, ERR 0.049 OK @ 32768.
