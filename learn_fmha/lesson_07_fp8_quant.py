@@ -32,10 +32,11 @@ MFMA K-step covers 32 kv).
 
 ### Idiomatic style (flydsl-layout-algebra skill)
 The 16x16x32 fp8 MFMA is declared ONCE as a typed atom -- `fx.make_mma_atom(fx.rocdl.MFMA(16,16,32,
-f8))` -- and both GEMMs run through `fly.mma_atom_call_ssa`, instead of repeating the raw
-`mfma_f32_16x16x32_fp8_fp8_` intrinsic. Everything fp8-specific stays direct on purpose (the skill's
-"hand-rolled register packing the algebra does not express cleanly" criterion): cvt_pk_fp8_f32
-packing, i32/i64 dword loads, per-tensor descale, and the P-transpose through LDS.
+f8))` -- fed to a `make_tiled_mma`, whose derived A/B/C fragment layouts drive `fx.gemm` for both
+GEMMs. Everything fp8-specific stays direct on purpose (the skill's "hand-rolled register packing the
+algebra does not express cleanly" criterion): cvt_pk_fp8_f32 packing, i32/i64 dword loads, per-tensor
+descale, and the P-transpose through LDS. The hand-packed operands are just bitcast to fp8 and dropped
+into the MMA fragments before `fx.gemm`. Online softmax stays direct too (a reduction, skill §7).
 
 Run:  HIP_VISIBLE_DEVICES=2 python3 learn_fmha/lesson_07_fp8_quant.py
 """
@@ -45,7 +46,6 @@ import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
@@ -82,24 +82,30 @@ def attn_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor,
     rO = fx.buffer_ops.create_buffer_resource(O)
 
     # IDIOMATIC (flydsl-layout-algebra skill, "tiled-MMA" recipe): declare the 16x16x32 fp8 MFMA
-    # ONCE as a typed layout-API atom and drive BOTH GEMMs through `fly.mma_atom_call_ssa`, instead
-    # of repeating the raw `rocdl.mfma_f32_16x16x32_fp8_fp8_` intrinsic. Operands stay the SAME packed
-    # i64 fp8 fragments + vec(4) f32 accumulator, so lane dataflow is unchanged.
-    # The fp8-SPECIFIC parts stay direct (skill: "hand-rolled register packing the algebra does not
-    # express cleanly"): cvt_pk_fp8_f32 packing, i32/i64 dword loads, per-tensor descale, and the
-    # P-transpose through LDS. The MFMA is the one piece that maps onto the typed atom cleanly.
-    f32x4 = fx.typing.T.vec(4, fx.typing.T.f32)
+    # ONCE as a typed layout-API atom; a `make_tiled_mma` then derives the A/B/C fragment layouts
+    # that drive BOTH GEMMs through `fx.gemm`. The fp8-SPECIFIC parts stay direct (skill: "hand-rolled
+    # register packing the algebra does not express cleanly"): cvt_pk_fp8_f32 packing, i32/i64 dword
+    # loads, per-tensor descale, and the P-transpose through LDS — those hand-packed operands are just
+    # bitcast to fp8 and dropped into the MMA fragments before `fx.gemm`.
     _mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.typing.T.f8))
+    # Layout-algebra MMA: one typed fp8 atom -> `make_tiled_mma` -> `fx.gemm` for BOTH GEMMs.
+    # All fp8-specific packing (cvt_pk_fp8_f32, i32/i64 dword loads, per-tensor descale, the LDS
+    # P-transpose) stays direct (skill's stay-direct case); the hand-packed operands are just
+    # dropped into the MMA fragments (bitcast to fp8) before `fx.gemm`.
+    tid = fx.thread_idx.x
+    tiled_mma = fx.make_tiled_mma(_mma_atom, fx.make_layout((1, 1, 1), (0, 0, 0)))
+    thr_mma = tiled_mma.thr_slice(tid)
+    Qb = fx.rocdl.make_buffer_tensor(Q)
+    Ob = fx.rocdl.make_buffer_tensor(O)
+    g_f8 = fx.slice(fx.flat_divide(Qb, (16, 32)), (None, None, 0, 0))   # (16,32) fp8 A/B shape donor
+    g_c = fx.slice(fx.flat_divide(Ob, (16, 16)), (None, None, 0, 0))    # (16,16) donor for the f32 C frag
 
-    def _mfma(a_i64, b_i64, acc):
-        return fly.mma_atom_call_ssa([f32x4], _mma_atom, a_i64, b_i64, acc)
-
-    # preload this lane's Q fragment (fp8, 8 per k-step as i64), reused across kv tiles.
+    # preload this lane's Q fragment (fp8, 8 per k-step), reused across kv tiles.
     q_packs = []
     for ks in fx.range_constexpr(KSTEPS):
         off = mn * fx.Int32(HD) + fx.Int32(ks * 32) + k_outer * fx.Int32(8)
         w = fx.buffer_ops.buffer_load(rQ, off // fx.Int32(4), vec_width=2, dtype=fx.Int32)
-        q_packs.append(fx.Vector(w).bitcast(fx.Int64)[0])
+        q_packs.append(fx.Vector(w).bitcast(fx.Float8E4M3FNUZ))   # vec(8) fp8
 
     qrow = mn
     if fx.const_expr(causal != 0):
@@ -124,18 +130,23 @@ def attn_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor,
         # exactly why the production kernel has an inner "sub-tile" structure.
         # After both, this lane holds 8 scores: sv[sub*4+e] = S[kv = kv0+sub*16+k_outer*4+e, q=mn].
         sv = []
+        frag_K = thr_mma.make_fragment_A(g_f8)
+        frag_Q = thr_mma.make_fragment_B(g_f8)
         for sub in fx.range_constexpr(2):
-            acc = fx.Vector.filled(4, 0.0, fx.Float32).ir_value()
+            frag_S = thr_mma.make_fragment_C(g_c)
+            frag_S.fill(0)
             for ks in fx.range_constexpr(KSTEPS):
                 k_row = kv0 + fx.Int32(sub * 16) + mn
                 k_row_safe = (k_row < sk_i).select(k_row, fx.Int32(0))
                 off = k_row_safe * fx.Int32(HD) + fx.Int32(ks * 32) + k_outer * fx.Int32(8)
                 kw = fx.buffer_ops.buffer_load(rK, off // fx.Int32(4), vec_width=2, dtype=fx.Int32)
-                k_i64 = fx.Vector(kw).bitcast(fx.Int64)[0]
-                acc = _mfma(k_i64.ir_value(), q_packs[ks].ir_value(), acc)
+                frag_K.store(fx.Vector(kw).bitcast(fx.Float8E4M3FNUZ))
+                frag_Q.store(q_packs[ks])
+                fx.gemm(_mma_atom, frag_S, frag_K, frag_Q, frag_S)
+            s_reg = frag_S.load()
             for e in fx.range_constexpr(4):
                 kv = kv0 + fx.Int32(sub * 16) + k_outer * fx.Int32(4) + fx.Int32(e)
-                s = fx.Float32(fx.Vector(acc)[e]) * qk_descale
+                s = fx.Float32(s_reg[e]) * qk_descale
                 sv.append((kv <= eff_bound).select(s, neg_inf))
 
         # ---- online softmax over all 8 own scores + cross-lane (4 k_outer groups) ----
@@ -179,11 +190,14 @@ def attn_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor,
         # B = P reloaded from LDS: lane needs 8 contiguous kv = k_outer*8 + e for q=mn.
         p_base = mn * fx.Int32(BKV) + k_outer * fx.Int32(8)
         p_vec8 = fx.Vector.load(fx.typing.T.vec(8, fx.typing.T.i8), p_lds, [fx.Index(p_base)])
-        p_i64 = fx.Vector(p_vec8).bitcast(fx.Int64)[0]
+        frag_B2 = thr_mma.make_fragment_B(g_f8)                       # B = P (8 contiguous kv/lane)
+        frag_B2.store(fx.Vector(p_vec8).bitcast(fx.Float8E4M3FNUZ))
+        frag_A2 = thr_mma.make_fragment_A(g_f8)
+        frag_O = thr_mma.make_fragment_C(g_c)
         corr4 = fx.Vector.filled(4, fx.Float32(corr), fx.Float32)
         new_o = []
         for dt in fx.range_constexpr(DT):
-            d_row = fx.Int32(dt * 16) + mn  # A=V^T: lane holds V[kv=k_outer*8+e, d=dt*16+mn]
+            d_row = fx.Int32(dt * 16) + mn  # A=Vᵀ: lane holds V[kv=k_outer*8+e, d=dt*16+mn]
             v_elems = []
             for e in fx.range_constexpr(8):
                 kv = kv0 + k_outer * fx.Int32(8) + fx.Int32(e)
@@ -191,10 +205,10 @@ def attn_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor,
                 kv_safe = kv_ok.select(kv, fx.Int32(0))
                 vv = fx.buffer_ops.buffer_load(rV, kv_safe * fx.Int32(HDV) + d_row, vec_width=1, dtype=fx.Int8)
                 v_elems.append(kv_ok.select(vv, fx.Int8(0)))
-            v_i64 = fx.Vector(fx.Vector.from_elements(v_elems, fx.Int8)).bitcast(fx.Int64)[0]
-            o_resc = (fx.Vector(o_acc[dt]) * corr4).ir_value()
-            o_new = _mfma(v_i64.ir_value(), p_i64.ir_value(), o_resc)
-            new_o.append(fx.Vector(o_new))
+            frag_A2.store(fx.Vector(fx.Vector.from_elements(v_elems, fx.Int8)).bitcast(fx.Float8E4M3FNUZ))
+            frag_O.store(fx.Vector(o_acc[dt]) * corr4)                # C = rescaled running accumulator
+            fx.gemm(_mma_atom, frag_O, frag_A2, frag_B2, frag_O)      # o_new = Vᵀ @ P + o_resc
+            new_o.append(frag_O.load())
         fx.gpu.barrier()
         st = yield [m_new, l_run] + new_o
 

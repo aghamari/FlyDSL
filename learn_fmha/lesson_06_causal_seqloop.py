@@ -32,11 +32,12 @@ sequence (prefix KV). Forgetting it silently breaks any case with sk != sq. Mask
 get score -inf -> p=0. The all-masked guard (Lesson 04) prevents NaN for fully-masked rows.
 
 ### Idiomatic style (flydsl-layout-algebra skill)
-Both GEMMs go through a single typed MFMA atom: `fx.make_mma_atom(fx.rocdl.MFMA(16,16,16, bf16))`
-driven by `fly.mma_atom_call_ssa`, instead of repeating the raw `mfma_f32_16x16x16bf16_1k_`
-intrinsic. The global LOADS stay direct: the per-lane causal-masked, strided kv gathers are the
-skill's "jagged / bespoke register packing" stay-direct case, so the zipped_divide / tiled_copy
-layout partitioning is deliberately not applied to them.
+Both GEMMs use the layout algebra: one typed MFMA atom `fx.make_mma_atom(fx.rocdl.MFMA(16,16,16,
+bf16))` feeds a `make_tiled_mma`, whose derived A/B/C fragment layouts drive `fx.gemm`. The global
+LOADS stay direct (`create_buffer_resource` + `buffer_load`): the per-lane causal-masked, strided
+kv gathers are the skill's "jagged / bespoke register packing" stay-direct case, so tiled-copy
+partitioning is deliberately not applied — the masked values are dropped into the MMA fragments by
+hand, then `fx.gemm` runs the matmul. The online softmax stays direct too (a reduction, skill §7).
 
 Run:  HIP_VISIBLE_DEVICES=2 python3 learn_fmha/lesson_06_causal_seqloop.py
 """
@@ -45,7 +46,6 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import fly
 
 BQ = 16
 BKV = 16
@@ -73,18 +73,20 @@ def attn_kernel(Q, K, V, O, sq: fx.Int32, sk: fx.Int32, sm_scale: fx.Constexpr[f
     rO = fx.buffer_ops.create_buffer_resource(O)
 
     # IDIOMATIC (flydsl-layout-algebra skill, "tiled-MMA" recipe): declare the 16x16x16 bf16 MFMA
-    # ONCE as a typed layout-API atom and drive BOTH GEMMs through `fly.mma_atom_call_ssa`, instead
-    # of repeating the raw `rocdl.mfma_f32_16x16x16bf16_1k_` intrinsic at each call site. The MFMA
-    # shape/dtype is named once; the call sites read as a matmul op. Operands are the SAME i16-bitcast
-    # vec(4) fragments as the raw intrinsic, so the lane dataflow is unchanged.
-    # The GLOBAL LOADS stay direct (create_buffer_resource + buffer_load): per-lane causal-masked,
-    # strided kv gathers are the skill's "jagged / bespoke register packing" stay-direct case — the
-    # zipped_divide/tiled_copy partitioning does not express them cleanly.
-    f32x4 = fx.typing.T.vec(4, fx.typing.T.f32)
+    # ONCE as a typed layout-API atom; a `make_tiled_mma` then derives the A/B/C fragment layouts
+    # that drive BOTH GEMMs through `fx.gemm`. The GLOBAL LOADS stay direct (create_buffer_resource
+    # + buffer_load): per-lane causal-masked, strided kv gathers are the skill's "jagged / bespoke
+    # register packing" stay-direct case, so tiled-copy partitioning is not applied — the masked
+    # values are dropped into the MMA fragments by hand, then `fx.gemm` runs the matmul.
     _mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
 
-    def _mfma(a_i16, b_i16, acc):
-        return fly.mma_atom_call_ssa([f32x4], _mma_atom, a_i16, b_i16, acc)
+    tid = fx.thread_idx.x
+    tiled_mma = fx.make_tiled_mma(_mma_atom, fx.make_layout((1, 1, 1), (0, 0, 0)))
+    thr_mma = tiled_mma.thr_slice(tid)
+    Qb = fx.rocdl.make_buffer_tensor(Q)
+    Ob = fx.rocdl.make_buffer_tensor(O)
+    g_bf16 = fx.slice(fx.flat_divide(Qb, (16, 16)), (None, None, 0, 0))   # (16,16) bf16 shape donor
+    g_f32 = fx.slice(fx.flat_divide(Ob, (16, 16)), (None, None, 0, 0))    # (16,16) f32  shape donor
 
     # this lane's query column q = mn (single q-tile at row 0..15). Preload Q fragment (reused).
     q_packs = []
@@ -111,29 +113,28 @@ def attn_kernel(Q, K, V, O, sq: fx.Int32, sk: fx.Int32, sm_scale: fx.Constexpr[f
         o_acc = [st[2 + d] for d in range(DT)]
         kv0 = fx.Int32(kt) * fx.Int32(BKV)
 
-        # GEMM1 for this kv-tile: sv[e] = S[kv = kv0 + k_outer*4 + e, q = mn]
-        acc = fx.Vector.filled(4, 0.0, fx.Float32).ir_value()
+        # GEMM1 for this kv-tile (fx.gemm): sv[e] = S[kv = kv0 + k_outer*4 + e, q = mn].
+        # A=K, B=Q. The K rows are OOB-masked (stay-direct load), then dropped into frag_K;
+        # `fx.gemm` accumulates over the KSTEPS hd sub-tiles into the C fragment.
+        frag_S = thr_mma.make_fragment_C(g_f32)
+        frag_S.fill(0)
+        frag_K = thr_mma.make_fragment_A(g_bf16)
+        frag_Q = thr_mma.make_fragment_B(g_bf16)
         for ks in fx.range_constexpr(KSTEPS):
             k0 = fx.Int32(ks * 16) + k_outer * fx.Int32(4)
-            kvrow = kv0 + k_outer * fx.Int32(4)  # base row; the 4 contiguous-K load is along hd
-            # K[kv = kv0 + k_outer*4 + (which?)]... we load K row = kv0 + (this lane's kv block).
-            # lane's A-fragment row is kv = kv0 + k_outer*4 + e is the OUTPUT row, not load row.
-            # For mfma A=K[kv=mn?]. Careful: in GEMM1 A=K, lane(k_outer,mn) loads K[row=mn, k].
-            # Output C row = k_outer*4+e. So the kv that ends in this lane's reg e is kv0+k_outer*4+e,
-            # but the K ROW we LOAD is mn-indexed. We must load K[kv = kv0 + mn].
+            # In GEMM1 A=K, lane(k_outer,mn) LOADS K row = kv0 + mn (output C row = k_outer*4+e).
             k_row = kv0 + mn
             k_row_safe = (k_row < sk_i).select(k_row, fx.Int32(0))
             k_vec = fx.buffer_ops.buffer_load(rK, k_row_safe * fx.Int32(HD) + k0, vec_width=4, dtype=fx.BFloat16)
-            acc = _mfma(
-                fx.Vector(k_vec).bitcast(fx.Int16).ir_value(),
-                fx.Vector(q_packs[ks]).bitcast(fx.Int16).ir_value(),
-                acc,
-            )
+            frag_K.store(fx.Vector(k_vec))
+            frag_Q.store(fx.Vector(q_packs[ks]))
+            fx.gemm(_mma_atom, frag_S, frag_K, frag_Q, frag_S)
         # apply scale + causal mask
+        s_reg = frag_S.load()
         sv = []
         for e in fx.range_constexpr(4):
             kv = kv0 + k_outer * fx.Int32(4) + fx.Int32(e)
-            s = fx.Float32(fx.Vector(acc)[e]) * fx.Float32(sm_scale)
+            s = fx.Float32(s_reg[e]) * fx.Float32(sm_scale)
             sv.append((kv <= eff_bound).select(s, neg_inf))
 
         # online softmax update
@@ -161,14 +162,17 @@ def attn_kernel(Q, K, V, O, sq: fx.Int32, sk: fx.Int32, sm_scale: fx.Constexpr[f
         # column at epilogue time. (If you instead make q the output ROW, each lane's inv_l would
         # belong to the wrong query — a classic flash-attention orientation bug.)
         # MFMA result[m=d,n=q]=sum_k A[m,k]B[n,k]: A[d,kv]=V[kv,d] (=V^T), B[q,kv]=P[q,kv].
-        b_bf16 = fx.Vector.from_elements([p[e].to(fx.BFloat16) for e in range(4)], fx.BFloat16)  # B=P[q=mn,kv=k_outer*4+e]
-        b_i16 = fx.Vector(b_bf16).bitcast(fx.Int16)
+        # B = P[q=mn, kv=k_outer*4+e] is register-resident; drop it straight into frag_B.
         corr4 = fx.Vector.filled(4, fx.Float32(corr), fx.Float32)
+        frag_B2 = thr_mma.make_fragment_B(g_bf16)
+        frag_B2.store(fx.Vector.from_elements([p[e].to(fx.BFloat16) for e in range(4)], fx.BFloat16))
+        frag_A2 = thr_mma.make_fragment_A(g_bf16)
+        frag_O = thr_mma.make_fragment_C(g_f32)
         new_o = []
         for dt in fx.range_constexpr(DT):
-            # A = V^T: lane holds A[d=mn? no — A[m=d,k=kv]] -> lane(k_outer,mn) holds A[d=mn, kv=k_outer*4+e]
-            #          = V[kv=k_outer*4+e, d=dt*16+mn].
-            d_row = fx.Int32(dt * 16) + mn  # the d this lane represents (output row index family)
+            # A = Vᵀ: lane(k_outer,mn) holds A[d=mn, kv=k_outer*4+e] = V[kv=k_outer*4+e, d=dt*16+mn].
+            # kv is V's strided/OOB-masked axis, so it stays a direct scalar gather into frag_A.
+            d_row = fx.Int32(dt * 16) + mn
             a_elems = []
             for e in fx.range_constexpr(4):
                 kv = kv0 + k_outer * fx.Int32(4) + fx.Int32(e)
@@ -176,11 +180,10 @@ def attn_kernel(Q, K, V, O, sq: fx.Int32, sk: fx.Int32, sm_scale: fx.Constexpr[f
                 kv_safe = kv_ok.select(kv, fx.Int32(0))
                 vval = fx.buffer_ops.buffer_load(rV, kv_safe * fx.Int32(HDV) + d_row, vec_width=1, dtype=fx.BFloat16)
                 a_elems.append(kv_ok.select(vval, fx.BFloat16(0.0)))
-            a_bf16 = fx.Vector.from_elements(a_elems, fx.BFloat16)
-            a_i16 = fx.Vector(a_bf16).bitcast(fx.Int16)
-            o_resc = (fx.Vector(o_acc[dt]) * corr4).ir_value()
-            o_new = _mfma(a_i16.ir_value(), b_i16.ir_value(), o_resc)
-            new_o.append(fx.Vector(o_new))
+            frag_A2.store(fx.Vector.from_elements(a_elems, fx.BFloat16))
+            frag_O.store(fx.Vector(o_acc[dt]) * corr4)                 # C = rescaled running accumulator
+            fx.gemm(_mma_atom, frag_O, frag_A2, frag_B2, frag_O)       # o_new = Vᵀ @ P + o_resc
+            new_o.append(frag_O.load())
         st = yield [m_new, l_run] + new_o
 
     m_run = st[0]
