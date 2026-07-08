@@ -28,13 +28,19 @@ is REAL and must be done (through LDS, or via ds_bpermute). We meet that head-on
 Lesson 07 (fp8) and fix it in Lessons 11-12. Teaching point: **whether you pay a transpose
 depends on the MFMA shape you chose** — it is not fundamental to attention.
 
-### Idiomatic note
-Both GEMMs use ONE typed MMA atom (`make_mma_atom` + `fly.mma_atom_call_ssa`) — declared
-once, called for QK and again per output d-tile for PV. The softmax stays direct (Lesson
-04). The explicit fragment loads/stores are kept on purpose: the lesson's whole point is
-that GEMM2's A-operand P[q,kv] is the SAME 4 registers softmax produced (no transpose for
-this 16x16x16 shape) — a fact you can only SEE in the hand-mapped lane layout, not under
-`fx.gemm`.
+### Idiomatic note (layout algebra)
+Both GEMMs use the layout algebra: ONE typed 16x16x16 MMA atom (`make_mma_atom`) feeds a
+`make_tiled_mma`, whose derived A/B/C fragment layouts drive `fx.gemm`, and
+`make_tiled_copy_{A,B,C}` moves global↔register. The softmax stays DIRECT (Lesson 04 /
+layout skill §7: reductions use register + `shuffle_xor`, not tiled copies).
+
+The headline "no-transpose" insight survives the port — just restated in fragment terms:
+softmax leaves P in the GEMM1 C-fragment, and for the 16x16x16 MFMA the C-fragment layout
+equals the GEMM2 A-fragment layout, so `p_norm[e]` stores straight into `frag_A[e]` with no
+transpose (see the `frag_A` block). V is row-major [kv,d], so the kv contraction is a
+STRIDED gather: we view V as [d,kv] (`make_view`) and use a scalar copy atom
+(`BufferCopy16b`) — exactly the 4 strided loads the hand-mapped code issued. Whether you
+pay a real transpose still depends on the MFMA shape (Lessons 07/11/12/17).
 
 Run:  HIP_VISIBLE_DEVICES=2 python3 learn_fmha/lesson_05_pv_fused.py
 """
@@ -43,7 +49,6 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import fly
 
 BQ = 16
 BKV = 16
@@ -56,35 +61,39 @@ LOG2E = 1.4426950408889634
 
 @flyc.kernel(known_block_size=[64, 1, 1])
 def attn_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, sm_scale: fx.Constexpr[float]):
-    lane = fx.Int32(fx.thread_idx.x)
-    k_outer = lane // fx.Int32(16)
-    mn = lane % fx.Int32(16)
+    tid = fx.thread_idx.x
     f32t = fx.typing.T.f32
     _ar = fx.arith.unwrap
 
-    rQ = fx.buffer_ops.create_buffer_resource(Q)
-    rK = fx.buffer_ops.create_buffer_resource(K)
-    rV = fx.buffer_ops.create_buffer_resource(V)
-    rO = fx.buffer_ops.create_buffer_resource(O)
+    K = fx.rocdl.make_buffer_tensor(K)
+    Q = fx.rocdl.make_buffer_tensor(Q)
 
     # IDIOMATIC: one typed 16x16x16 bf16 MFMA atom serves BOTH attention GEMMs.
     mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
-    f32x4 = fx.typing.T.vec(4, fx.typing.T.f32)
 
-    # --- GEMM1: S[kv=k_outer*4+e, q=mn] ---
-    acc = fx.Vector.filled(4, 0.0, fx.Float32).ir_value()
-    for ks in fx.range_constexpr(KSTEPS):
-        k0 = fx.Int32(ks * 16) + k_outer * fx.Int32(4)
-        k_vec = fx.buffer_ops.buffer_load(rK, mn * fx.Int32(HD) + k0, vec_width=4, dtype=fx.BFloat16)
-        q_vec = fx.buffer_ops.buffer_load(rQ, mn * fx.Int32(HD) + k0, vec_width=4, dtype=fx.BFloat16)
-        acc = fly.mma_atom_call_ssa(
-            [f32x4],
-            mma_atom,
-            fx.Vector(k_vec).bitcast(fx.Int16).ir_value(),
-            fx.Vector(q_vec).bitcast(fx.Int16).ir_value(),
-            acc,
-        )
-    sv = [fx.Float32(fx.Vector(acc)[e]) * fx.Float32(sm_scale) for e in range(4)]
+    # --- GEMM1 (layout algebra): S[kv, q] = K @ Qᵀ  (A=K m=kv, B=Q n=q, k=hd) ---
+    # `make_tiled_mma` derives the A/B/C fragment layouts; tiled copies move global→reg.
+    tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (0, 0, 0)))
+    thr_mma = tiled_mma.thr_slice(tid)
+    gK = fx.slice(fx.flat_divide(K, (BKV, 16)), (None, None, 0, None))   # (kv, k, nK)
+    gQ = fx.slice(fx.flat_divide(Q, (BQ, 16)), (None, None, 0, None))    # (q,  k, nK)
+    # S is register-only; borrow a (BKV, BQ) tile purely as a C-fragment shape donor.
+    gS = fx.slice(fx.flat_divide(K, (BKV, BQ)), (None, None, 0, 0))      # (kv, q) shape
+    cp_ab = fx.make_copy_atom(fx.rocdl.BufferCopy((BKV * 16 // 64) * 16), fx.BFloat16)
+    tcK = fx.make_tiled_copy_A(cp_ab, tiled_mma).get_slice(tid)
+    tcQ = fx.make_tiled_copy_B(cp_ab, tiled_mma).get_slice(tid)
+    thr_gK = tcK.partition_S(gK)
+    thr_gQ = tcQ.partition_S(gQ)
+    frag_K = thr_mma.make_fragment_A(fx.slice(gK, (None, None, 0)))
+    frag_Q = thr_mma.make_fragment_B(fx.slice(gQ, (None, None, 0)))
+    frag_S = thr_mma.make_fragment_C(gS)
+    frag_S.fill(0)
+    for kt in fx.range_constexpr(KSTEPS):
+        fx.copy(cp_ab, fx.slice(thr_gK, (None, None, None, kt)), tcK.retile(frag_K))
+        fx.copy(cp_ab, fx.slice(thr_gQ, (None, None, None, kt)), tcQ.retile(frag_Q))
+        fx.gemm(mma_atom, frag_S, frag_K, frag_Q, frag_S)
+    # frag_S: lane holds S[kv=k_outer*4+e, q=mn], e=0..3 (same layout the manual code had).
+    sv = [fx.Float32(frag_S.load()[e]) * fx.Float32(sm_scale) for e in range(4)]
 
     # --- softmax over kv (Lesson 04) -> p[e] = P[kv=k_outer*4+e, q=mn], normalized ---
     m = sv[0]
@@ -102,32 +111,33 @@ def attn_kernel(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, O: fx.Tensor, sm_scale
     inv_l = fx.Float32(1.0) / l
     p_norm = [p[e] * inv_l for e in range(4)]
 
-    # --- GEMM2: A = P (already register-resident, no transpose), B = V^T, per d-tile ---
-    # A-fragment as bf16 vector<4>: lane holds P[q=mn, kv=k_outer*4+e] = p_norm[e].
-    a_bf16 = fx.Vector.from_elements([p_norm[e].to(fx.BFloat16) for e in range(4)], fx.BFloat16)
-    a_i16 = fx.Vector(a_bf16).bitcast(fx.Int16)
+    # --- GEMM2 (layout algebra): O[q, d] = P @ V  (A=P m=q, B=Vᵀ n=d, k=kv) ---
+    # A = P is ALREADY register-resident from softmax. For the 16x16x16 MFMA the GEMM1
+    # C-fragment layout equals the GEMM2 A-fragment layout, so p_norm[e] drops straight
+    # into frag_A[e] — no transpose (the headline lesson, now stated in fragment terms).
+    gA = fx.slice(fx.flat_divide(K, (BQ, BKV)), (None, None, 0, 0))       # (q, kv) shape donor
+    frag_A = thr_mma.make_fragment_A(gA)
+    frag_A.store(fx.Vector.from_elements([p_norm[e].to(fx.BFloat16) for e in range(4)], fx.BFloat16))
+
+    # B = Vᵀ: V is stored [kv, d]; view it as [d, kv] so a tiled copy expresses the
+    # kv-contraction gather. kv is strided by HDV there (the "V transpose"), so the copy
+    # atom is scalar (BufferCopy16b) — the same 4 strided loads the hand code issued.
+    V = fx.rocdl.make_buffer_tensor(V)
+    O = fx.rocdl.make_buffer_tensor(O)
+    Vt = fx.make_view(fx.get_iter(V), fx.make_layout((HDV, BKV), (1, HDV)))   # [d, kv]
+    cp_v = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
+    cp_c = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+    tcB = fx.make_tiled_copy_B(cp_v, tiled_mma).get_slice(tid)
+    tcC = fx.make_tiled_copy_C(cp_c, tiled_mma).get_slice(tid)
     for dt in fx.range_constexpr(DT):
-        # B = V^T: lane holds V[kv=k_outer*4+e, d=dt*16+mn], stored [kv, d] row-major (stride HDV).
-        d_col = fx.Int32(dt * 16) + mn
-        b_bf16 = fx.Vector.from_elements(
-            [fx.buffer_ops.buffer_load(rV, (k_outer * fx.Int32(4) + fx.Int32(e)) * fx.Int32(HDV) + d_col,
-                                       vec_width=1, dtype=fx.BFloat16) for e in range(4)],
-            fx.BFloat16,
-        )
-        b_i16 = fx.Vector(b_bf16).bitcast(fx.Int16)
-        o = fly.mma_atom_call_ssa(
-            [f32x4],
-            mma_atom,
-            a_i16.ir_value(),
-            b_i16.ir_value(),
-            fx.Vector.filled(4, 0.0, fx.Float32).ir_value(),
-        )
-        ov = fx.Vector(o)
-        # C result: lane holds O[q=k_outer*4+e, d=dt*16+mn]
-        for e in fx.range_constexpr(4):
-            q = k_outer * fx.Int32(4) + fx.Int32(e)
-            d = fx.Int32(dt * 16) + mn
-            fx.buffer_ops.buffer_store(fx.Float32(ov[e]).ir_value(), rO, (q * fx.Int32(HDV) + d).ir_value())
+        gV = fx.slice(fx.flat_divide(Vt, (16, 16)), (None, None, dt, 0))      # (d, kv) tile dt
+        gO = fx.slice(fx.flat_divide(O, (BQ, 16)), (None, None, 0, dt))       # (q, d) tile dt
+        frag_B = thr_mma.make_fragment_B(gV)
+        fx.copy(cp_v, tcB.partition_S(gV), tcB.retile(frag_B))
+        frag_O = thr_mma.make_fragment_C(gO)
+        frag_O.fill(0)
+        fx.gemm(mma_atom, frag_O, frag_A, frag_B, frag_O)
+        fx.copy(cp_c, tcC.retile(frag_O), tcC.partition_S(gO))
 
 
 @flyc.jit

@@ -39,6 +39,24 @@ import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
+import flydsl
+from flydsl.utils.env import DebugEnvManager, RuntimeEnvManager
+from flydsl._mlir import ir
+import os
+
+# # ---- debug preamble (from the slide, cache forced off) ----
+# DebugEnvManager.enable_debug_info = True
+# DebugEnvManager.dump_asm = True
+# DebugEnvManager.dump_ir = True
+# DebugEnvManager.dump_dir = os.path.join(os.path.dirname(__file__), "vadd_dbg")
+# ir._globals.register_traceback_file_inclusion(__file__)
+# ir._globals.register_traceback_file_exclusion(os.path.dirname(flydsl.__file__))
+# ir._globals.set_loc_tracebacks_frame_limit(40)
+# ir._globals.set_loc_tracebacks_enabled(True)
+# RuntimeEnvManager.enable_cache = False
+# os.environ["FLYDSL_RUNTIME_ENABLE_CACHE"] = "0"
+
+
 # One 16x16x16 bf16 atom (the shape fx.gemm supports), tiled 2x2 across waves.
 M_MMA, N_MMA, K_MMA = 16, 16, 16
 WAVE_M, WAVE_N = 2, 2                      # 2 warps along A (M), 2 along B (N)
