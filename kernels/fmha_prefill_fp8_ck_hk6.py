@@ -651,3 +651,46 @@ def run_attn(
     attn_kernel(
         Q, K, V, Qd, Kd, Vd, LTD, LTP, Ps, O, sq, sk, nq, nk, page_size, k_page_stride, v_page_stride, sm_scale, causal
     ).launch(grid=(grid_blocks,), block=(NTHREADS,), stream=stream)
+
+
+# ---------------------------------------------------------------------------------------------
+# Per-seqlen (KT, DIAG) dispatch. FMHA_KT / FMHA_DIAG are compile-time constexpr read at import,
+# and FlyDSL's SmemAllocator finalizes once per process, so one process = ONE (KT,DIAG). Call
+# get_kernel(sq) ONCE per process; it sets the env then (re)imports THIS module fresh.
+# Measured device-fair (graph-replay) on MI308X, TF (bigger KT = fewer tiles = less per-tile
+# LDS-wait/barrier/store overhead, which dominates at short seq; DIAG = CK's diagonal-pair
+# causal load-balancer, a win except at sq<=1024 where grid-halving loses):
+#     sq1024  KT64 DIAG0 -> 28   (default KT32 DIAG1: 21;  CK 30)
+#     sq2048  KT64 DIAG1 -> 59   (default: 54;             CK 62)
+#     sq16384 KT32 DIAG0 -> 143  (default DIAG1: 140;      CK 141)  <- beats CK
+#     sq32768 KT32 DIAG1 -> 160  (default: 160;            CK 146)  <- beats CK
+# Net best-of-all: 28 / 59 / 143 / 160 TF. All correctness-gated OK (err < 6e-2).
+# ---------------------------------------------------------------------------------------------
+def best_kt_diag(sq: int) -> tuple[int, int]:
+    """Return the measured-optimal (KT, DIAG) for this seqlen."""
+    if sq <= 1024:
+        return 64, 0
+    if sq <= 2048:
+        return 64, 1
+    if sq <= 16384:
+        return 32, 0
+    return 32, 1
+
+
+def get_kernel(sq: int):
+    """Set (KT, DIAG) for this seqlen, (re)import THIS module fresh, return it.
+
+    Usage (exposes run_attn / BM / HD / V_COL like the base kernel):
+        K = get_kernel(sq)
+        grid = b * nq * ((sq + K.BM - 1) // K.BM)
+        K.run_attn(*args, ..., grid)
+    Call ONCE per process for a given seqlen (SmemAllocator finalizes once/process).
+    """
+    import importlib
+    import sys as _sys
+
+    kt, diag = best_kt_diag(sq)
+    os.environ["FMHA_KT"] = str(kt)
+    os.environ["FMHA_DIAG"] = str(diag)
+    _sys.modules.pop(__name__, None)
+    return importlib.import_module(__name__)
