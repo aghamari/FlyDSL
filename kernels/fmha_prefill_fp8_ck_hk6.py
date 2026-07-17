@@ -58,6 +58,10 @@ NBUF = int(os.environ.get("FMHA_NBUF", "2"))  # LDS alloc depth (loop is 2-deep 
 # CK async global->LDS for K via buffer_load_to_lds. DISABLED: broken in flydsl 0.2.0 (wrong
 # results; the pre-existing v12 that uses it also fails correctness while its VGPR parent v7 passes).
 BUFK = int(os.environ.get("FMHA_BUFK", "0")) != 0
+# G2HOIST (default 0 = OFF): hoist the GEMM2 V LDS reads to overlap the softmax exp2/rescale VALU
+# (the V packs depend only on vbuf, not on P), so the PV MFMA (top ATT stall @sq4k, L547) no longer
+# waits on the V read lgkmcnt. Trades live VGPR (V packs held across softmax) for the overlap.
+G2HOIST = int(os.environ.get("FMHA_G2HOIST", "0")) != 0
 
 # COLUMN-MAJOR V (CK's true vec_k_col_v): V pool [pages, nk, hd, page_size] has kv (the GEMM2
 # contraction dim) CONTIGUOUS per (head, d). The cooperative load then copies V->LDS straight
@@ -463,6 +467,22 @@ def attn_kernel(
                 # FMA addend for the u-space exp: -safe_m_p == log2_pscale - safe_m.
                 neg_safe_m_p = log2_pscale - safe_m
 
+            # G2HOIST: issue the GEMM2 V LDS reads now (they depend only on vbuf, not on P/softmax)
+            # so their lgkmcnt is satisfied while the exp2/rescale VALU runs -> the PV MFMA no longer
+            # stalls on the V read. Costs live VGPR (V packs held across the softmax burst).
+            v_packs_hoist = None
+            if const_expr(G2HOIST):
+                v_packs_hoist = []
+                for sub in fx.range_constexpr(NSUB):
+                    vp = []
+                    for dt in fx.range_constexpr(DT):
+                        d_col = fx.Int32(dt * 32) + (lane % fx.Int32(32))
+                        for s in fx.range_constexpr(2):
+                            v_lds_elem = vbuf + d_col * fx.Int32(_V_LDSW) + fx.Int32(sub * BN) + fx.Int32(s * 16) + half * fx.Int32(8)
+                            vv8 = fx.Vector.load(fx.typing.T.vec(8, fx.typing.T.i8), vt_lds, [fx.Index(v_lds_elem)])
+                            vp.append(fx.Vector(vv8).bitcast(fx.Int64)[0])
+                    v_packs_hoist.append(vp)
+
             # exp + running-sum (per element), then a single rescale of o_acc.
             l_loc = fx.Float32(0.0)
             p_all = []
@@ -530,13 +550,16 @@ def attn_kernel(
             # --- GEMM2 for all subtiles: O[d,q] += V^T @ P ---
             for sub in fx.range_constexpr(NSUB):
                 p_i64_s = p_i64_all[sub]
-                v_packs = []
-                for dt in fx.range_constexpr(DT):
-                    d_col = fx.Int32(dt * 32) + (lane % fx.Int32(32))
-                    for s in fx.range_constexpr(2):
-                        v_lds_elem = vbuf + d_col * fx.Int32(_V_LDSW) + fx.Int32(sub * BN) + fx.Int32(s * 16) + half * fx.Int32(8)
-                        vv8 = fx.Vector.load(fx.typing.T.vec(8, fx.typing.T.i8), vt_lds, [fx.Index(v_lds_elem)])
-                        v_packs.append(fx.Vector(vv8).bitcast(fx.Int64)[0])
+                if const_expr(G2HOIST):
+                    v_packs = v_packs_hoist[sub]
+                else:
+                    v_packs = []
+                    for dt in fx.range_constexpr(DT):
+                        d_col = fx.Int32(dt * 32) + (lane % fx.Int32(32))
+                        for s in fx.range_constexpr(2):
+                            v_lds_elem = vbuf + d_col * fx.Int32(_V_LDSW) + fx.Int32(sub * BN) + fx.Int32(s * 16) + half * fx.Int32(8)
+                            vv8 = fx.Vector.load(fx.typing.T.vec(8, fx.typing.T.i8), vt_lds, [fx.Index(v_lds_elem)])
+                            v_packs.append(fx.Vector(vv8).bitcast(fx.Int64)[0])
                 for dt in fx.range_constexpr(DT):
                     acc2 = fx.Vector(o_acc[dt]).ir_value()
                     for s in fx.range_constexpr(2):
@@ -690,7 +713,13 @@ def get_kernel(sq: int):
     import sys as _sys
 
     kt, diag = best_kt_diag(sq)
+    # G2HOIST (GEMM2 V-LDS-read hoist): measured device-fair a small win in the MID zone
+    # (2048->60, 4096 88->90, 8192 119->121, 16384 143->144) but a -9.5% REGRESSION at sq32768
+    # (158->143; the +9 VGPR tips the diagonal-pair large-seq budget) and neutral at sq1024. So
+    # enable it only for 2048 <= sq <= 16384.
+    hoist = 1 if (2048 <= sq <= 16384) else 0
     os.environ["FMHA_KT"] = str(kt)
     os.environ["FMHA_DIAG"] = str(diag)
+    os.environ["FMHA_G2HOIST"] = str(hoist)
     _sys.modules.pop(__name__, None)
     return importlib.import_module(__name__)
