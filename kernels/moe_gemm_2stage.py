@@ -104,6 +104,7 @@ def compile_moe_gemm1(
     use_cshuffle_epilog: bool | None = None,
     scale_is_bf16: bool = False,
     k_batch: int = 1,
+    act: str | None = None,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -137,6 +138,15 @@ def compile_moe_gemm1(
     elem_bytes = 2 if is_f16_or_bf16 else 1
     if out_dtype not in ("f16", "bf16"):
         raise ValueError(f"out_dtype must be 'f16' or 'bf16', got {out_dtype!r}")
+
+    # Stage1 epilogue activation. "silu" = fused SiLU(gate)*up (default MoE behavior).
+    # "none" = write the raw gate-projection GEMM result (no activation, no gate*up
+    # reduction); the gate+up MFMA work is unchanged, so this isolates pure grouped-GEMM
+    # throughput. Env fallback FLYDSL_MOE_STAGE1_ACT lets callers (e.g. run_moe_stage1)
+    # select it without threading a new kwarg through every call site.
+    act = (act if act is not None else os.environ.get("FLYDSL_MOE_STAGE1_ACT", "silu")).lower()
+    if act not in ("silu", "none"):
+        raise ValueError(f"act must be 'silu' or 'none', got {act!r}")
 
     # NOTE: don't materialize MLIR types outside an active MLIR Context.
     def out_mlir():
@@ -1585,7 +1595,11 @@ def compile_moe_gemm1(
                             vg = vg * sx * sw_gate
                             vu = vu * sx * sw_up
 
-                            y = silu(vg) * vu
+                            # act="none": pure GEMM, no activation. Sum gate+up so BOTH
+                            # MFMA chains stay live (writing gate alone lets the compiler
+                            # DCE the up GEMM, halving the measured work). FLOPs/BW then
+                            # match the real 2*inter_dim grouped GEMM.
+                            y = (vg + vu) if const_expr(act == "none") else silu(vg) * vu
                             if const_expr(doweight_stage1):
                                 y = y * tw
                             y16 = arith.trunc_f(T.f16, y)
@@ -1708,7 +1722,11 @@ def compile_moe_gemm1(
                             vg = vg * sx * sw_gate
                             vu = vu * sx * sw_up
 
-                            y = silu(vg) * vu
+                            # act="none": pure GEMM, no activation. Sum gate+up so BOTH
+                            # MFMA chains stay live (writing gate alone lets the compiler
+                            # DCE the up GEMM, halving the measured work). FLOPs/BW then
+                            # match the real 2*inter_dim grouped GEMM.
+                            y = (vg + vu) if const_expr(act == "none") else silu(vg) * vu
                             if const_expr(doweight_stage1):
                                 y = y * tw
                             y = arith.trunc_f(out_mlir(), y)

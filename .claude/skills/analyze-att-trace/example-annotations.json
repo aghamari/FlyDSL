@@ -1,0 +1,43 @@
+{
+  "annotations": [
+    {
+      "id": "kfeed-stall",
+      "severity": "critical",
+      "title": "MFMA feed stalls 51k cy waiting on K buffer loads",
+      "note": "s_waitcnt vmcnt(7) at idx 559 gates the first v_mfma of each K-tile. It waits on the three buffer_load_dwordx4 at idx 562-564, issued only ~100 cy earlier, so the matrix engine idles ~51k cy across the wave.",
+      "category": "mfma-feed",
+      "confidence": 0.9,
+      "suggestion": "Software-pipeline the K load one tile ahead so it overlaps the previous tile's MFMAs.",
+      "metric": 51584,
+      "anchor": { "instIdxs": [559, 562, 563, 564], "source": { "file": "attn.py", "line": 459 } }
+    },
+    {
+      "id": "narrow-loads",
+      "severity": "high",
+      "title": "228x single-dword buffer_load where a wider load would do",
+      "note": "The descale path loads scalars one dword at a time. Coalescing into dwordx4 would cut the transaction count 4x.",
+      "category": "mem-width",
+      "confidence": 0.7,
+      "metric": 228,
+      "anchor": { "source": { "file": "attn.py", "line": 450, "endLine": 466 } }
+    },
+    {
+      "id": "leading-idle-se0sm2",
+      "severity": "medium",
+      "title": "Wave SE0/SM2 idles ~24k cy before first issue",
+      "note": "This wave sits IDLE from begin until the first instruction issues — a scheduling/launch imbalance, visible as the leading gap on its lane.",
+      "category": "wave-imbalance",
+      "confidence": 0.6,
+      "anchor": { "wave": { "se": 0, "sm": 2, "slot": 0 }, "time": [0, 24000] }
+    },
+    {
+      "id": "low-occupancy",
+      "severity": "medium",
+      "title": "Occupancy peaks at 8/16 waves — likely VGPR pressure",
+      "note": "occupancy.json shows active waves plateauing near half of peak for the whole dispatch; reducing register pressure would let more waves hide latency.",
+      "category": "occupancy",
+      "confidence": 0.5,
+      "anchor": null
+    }
+  ]
+}
